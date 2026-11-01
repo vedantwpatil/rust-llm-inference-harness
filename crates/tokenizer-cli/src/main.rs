@@ -5,7 +5,7 @@ use tokenizer::{
 };
 
 fn main() -> Result<(), String> {
-    println!("Hello, rust tokenizer!\n");
+    println!("Hello, rust tokenizer!");
 
     // We need to take in input "prompt"
     let prompt = take_input()?;
@@ -27,7 +27,8 @@ fn main() -> Result<(), String> {
     let tokenizer = Tokenizer::train(&corpus, TOY_VOCAB_SIZE);
 
     // DISPLAY
-    println!("Prompt: {prompt:?}\n");
+    section("Prompt");
+    println!("{prompt:?}  ({} bytes)", prompt.len());
 
     // Should consider running this into a llm or having some visual/demonstration of how each
     // tokenizer works and the performance of it. That might be something to do after the tokenizers
@@ -36,21 +37,51 @@ fn main() -> Result<(), String> {
     //
     // Some ideas on displays with just the tokenizer itself were to figure out the compresion ratio
     // it was able to determine and printing out the merged tokens to see the patterns it learned
-    println!("Tokenizing word by word: {word_by_word:?}\n");
-    println!("Tokenizing char by char: {char_by_char:?}\n");
-    println!("Tokenizing byte by byte: {byte_by_byte:?}\n");
+    section("Baselines");
     println!(
-        "Tokenize with BPE\nVocab:{:?}\n\nMerges{:?}\n\n",
-        tokenizer.vocab, tokenizer.merges
+        "word {:>4} tokens  {}",
+        word_by_word.len(),
+        preview(&word_by_word)
+    );
+    println!(
+        "char {:>4} tokens  {}",
+        char_by_char.len(),
+        preview(&char_by_char)
+    );
+    println!(
+        "byte {:>4} tokens  {}",
+        byte_by_byte.len(),
+        preview(&byte_by_byte)
     );
 
+    section("BPE: what training learned");
+    println!(
+        "{} vocab entries, {} merges (rank: pair -> new token)",
+        tokenizer.vocab.len(),
+        tokenizer.merges.len()
+    );
+    for (rank, (a, b)) in tokenizer.merges.iter().enumerate() {
+        println!("  {rank:>3}: {a:>5} + {b:<5} -> {a}{b}");
+    }
+
     let ids = tokenizer.encode(&prompt);
-    let tokens: Vec<&str> = ids.iter().map(|&id| tokenizer.vocab[id].as_str()).collect();
-    println!("Encoded ids: {ids:?}\n");
-    println!("Encoded tokens: {tokens:?}\n");
+    section("BPE: encoded prompt");
+    println!("{} tokens", ids.len());
+    println!("  {:>3}  {:>5}  token", "pos", "id");
+    for (pos, &id) in ids.iter().enumerate().take(PREVIEW) {
+        println!("  {pos:>3}  {id:>5}  {:?}", tokenizer.vocab[id]);
+    }
+    if ids.len() > PREVIEW {
+        println!("  ... +{} more", ids.len() - PREVIEW);
+    }
 
     let decoded_prompt = tokenizer.decode(&ids).unwrap();
-    println!("Prompt after being encoded and decoded: {decoded_prompt:?}\n");
+    let verdict = if decoded_prompt == prompt {
+        "ok"
+    } else {
+        "MISMATCH"
+    };
+    println!("round trip {verdict}: {decoded_prompt:?}");
 
     // METRICS
     // The trained vocab is tiny, so GPT-2's published merges are the useful
@@ -82,10 +113,14 @@ fn main() -> Result<(), String> {
         }
         Err(e) => println!("(no GPT-2 row: {GPT2_MERGES_PATH}: {e})"),
     }
-    println!("Compression of the same {} byte prompt", prompt.len());
+    section(&format!(
+        "Compression of the same {} byte prompt",
+        prompt.len()
+    ));
+    println!("{:>6}  {:>11}  tokenizer", "tokens", "bytes/token");
     for (name, n) in counts {
         let ratio = bytes_per_token(&prompt, n);
-        println!("{n:>5} tokens, {ratio:>5.2} bytes/token  {name}");
+        println!("{n:>6}  {ratio:>11.2}  {name}");
     }
 
     Ok(())
@@ -95,6 +130,24 @@ fn take_input() -> Result<String, String> {
     env::args()
         .nth(1)
         .ok_or_else(|| "No prompt provided".to_string())
+}
+
+// Rows or items shown before a long list is cut with "+N more".
+const PREVIEW: usize = 40;
+
+fn section(title: &str) {
+    println!(
+        "\n── {title} {}",
+        "─".repeat(56usize.saturating_sub(title.len()))
+    );
+}
+
+fn preview<T: std::fmt::Debug>(items: &[T]) -> String {
+    let shown = &items[..items.len().min(PREVIEW)];
+    match items.len() - shown.len() {
+        0 => format!("{shown:?}"),
+        cut => format!("{shown:?} ... +{cut} more"),
+    }
 }
 
 const GPT2_MERGES_PATH: &str = concat!(

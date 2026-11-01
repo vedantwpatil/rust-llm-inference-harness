@@ -6,7 +6,7 @@ Technical write-ups of what has been built, per stage, with reasoning and open q
 
 ## Stage 1: byte-level BPE trainer
 
-Status: trainer done, encoder and decoder not started. Progress and open decisions: [ROADMAP.md](ROADMAP.md#stage-1-tokenizer-byte-level-bpe).
+Status: stage 1 complete (trainer, encoder, decoder with streaming, specials, GPT-2 loader, tiktoken oracle). Only the trainer is written up below; the encoder, `Tokenizer` and oracle are in [ROADMAP.md](ROADMAP.md#stage-1-tokenizer-byte-level-bpe). Progress and open decisions: [ROADMAP.md](ROADMAP.md#stage-1-tokenizer-byte-level-bpe).
 
 ### Data flow
 
@@ -97,21 +97,36 @@ Every iteration recounts all pairs from scratch.
 - Total is about `merges × symbols`. Fine for the toy corpus, wrong shape for a real one. Standard fix: incremental pair counts, updating only chunks a merge touched, with a heap for the argmax. Not done: correctness first, per [CLAUDE.md](../CLAUDE.md).
 - Pair counts are `u32` and overflow past about 4.29e9 occurrences of one pair.
 
+### Decoder
+
+`Tokenizer::token_bytes(id, out: &mut Vec<u8>)` appends one id's bytes to `out`. A special's text is plain UTF-8, so it is looked up first (`specials`, linear scan) and copied whole. Any other id's `vocab` entry is symbol chars, each mapped back to a byte through `char_to_byte`. It appends instead of returning a `Vec` so no allocation happens per token.
+
+- **`decode(&[usize]) -> Result<String, FromUtf8Error>`** calls `token_bytes` for every id into one `Vec<u8>` and runs `String::from_utf8` once at the end. A merged token can end mid-character, so converting per token would fail on valid input. A cut character at the very end is an `Err`.
+- **`decode_stream(id, &mut pending) -> Result<String, Utf8Error>`** appends the id's bytes to `pending`, then `std::str::from_utf8(pending)`:
+  - `Ok(s)`: everything is complete. Return it, clear `pending`.
+  - `Err(e)` with `e.error_len() == None`: the bytes end mid-character. Drain the first `e.valid_up_to()` bytes out of `pending` and return them as text, the tail stays for the next call.
+  - `Err(e)` otherwise: invalid bytes, return the error. `pending` is left as is, so the caller clears it.
+- **State is the caller's.** `pending` is a parameter, not a field, so `decode_stream` takes `&self` and one `Tokenizer` can serve several streams. A stage 4 `Session` will own its own buffer.
+- **End of stream.** A non-empty `pending` is a cut character. There is no flush method: the caller decides whether that is an error.
+- **Error type.** `decode_stream` returns `Utf8Error` (from `str::from_utf8` on a slice), `decode` returns `FromUtf8Error` (from `String::from_utf8`, which owns the `Vec`).
+
+Tests: `decode_stream_holds_back_a_cut_codepoint`, `decode_stream_leaves_an_unfinished_tail_pending`, `decode_stream_rejects_invalid_bytes` (`0xFF` can start no UTF-8 sequence, so `error_len()` is `Some`), `decode_stream_matches_decode`.
+
 ### Known limitations and open decisions
 
 Resolved items stay in place, marked resolved. Never delete.
 
 - **Resolved (2026-10-22): corpus selection.** `tokenize_bpe(prompt)` trained on the prompt if over 100 bytes, else on four HF course sentences, at the fixed `VOCAB_SIZE`. Corpus and `vocab_size` are now arguments. `main` still applies the 100-byte rule, passing `TOY_CORPUS` or the prompt, with `VOCAB_SIZE` as its default. The `Tokenizer { vocab, merges, pattern }` struct is still to come.
-- **Open: id layout differs from GPT-2.** Bytes sit in byte order after `<|endoftext|>`. GPT-2 puts the 188 printable bytes first, then the 68 shifted ones, then merges, then `<|endoftext|>` at 50256. There `Ġ` is 220 and the first merge `Ġt` 256; here `Ġ` is 33. Matching tiktoken needs GPT-2's base order or a remap in the oracle test.
+- **Resolved (2026-10-24, see ROADMAP): id layout differs from GPT-2.** Each constructor picks its layout; `from_gpt2_merges` matches GPT-2's. Trained tokenizers keep the layout below. Original note: Bytes sit in byte order after `<|endoftext|>`. GPT-2 puts the 188 printable bytes first, then the 68 shifted ones, then merges, then `<|endoftext|>` at 50256. There `Ġ` is 220 and the first merge `Ġt` 256; here `Ġ` is 33. Matching tiktoken needs GPT-2's base order or a remap in the oracle test.
 - **Open: tie-break differs from reference trainers.** See above. Affects trained artifacts only, not encoding with published GPT-2 merges.
-- **Open: no encoder or decoder.** Merges are learned but never replayed on new text.
+- **Resolved (2026-10-24): no encoder or decoder.** `encode_chunk`, `Tokenizer::encode` and `Tokenizer::decode` replay merges on new text. Streaming decode followed on 2026-10-31, see Decoder below.
 - **Open: table verified against a Python port, not in-repo.** A one-time check compared all 256 entries with a Python port of GPT-2's `bytes_to_unicode`. Tests check five known entries plus bijectivity and printability. The tiktoken oracle test will cover the rest.
 - **Resolved: nondeterministic merges.** Caused by `HashMap` iteration with a strict `>` and no tie-break, and by an alphabet collected from a `HashMap`. Fixed by the `(count, pair)` total order and the fixed byte table.
 - **Resolved: decimal-string byte symbols.** Rejected for the merge ambiguity above, replaced by the GPT-2 table.
 
 ### Tests
 
-20 tests in `crates/tokenizer/src/tests.rs`. The first 10 cover the pre-tokenizer (splits checked against tiktoken's pattern), the rest the byte table and trainer. Most trainer tests use `train()`, which trains `TOY_CORPUS` at `TOY_VOCAB_SIZE` via `Tokenizer::train`. The last two pass their own text as a one-element corpus.
+The table covers the 20 trainer-stage tests in `crates/tokenizer/src/tests.rs` (51 in total now, including encoder, oracle, decoder and streaming tests, `trains_the_roadmap_toy_merges` among them). The first 10 cover the pre-tokenizer (splits checked against tiktoken's pattern), the rest the byte table and trainer. Most trainer tests use `train()`, which trains `TOY_CORPUS` at `TOY_VOCAB_SIZE` via `Tokenizer::train`. The last two pass their own text as a one-element corpus.
 
 | Test                                      | What it guards                                                                                          |
 | ----------------------------------------- | ------------------------------------------------------------------------------------------------------- |

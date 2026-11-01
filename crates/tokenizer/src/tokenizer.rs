@@ -120,18 +120,43 @@ impl Tokenizer {
         let mut bytes: Vec<u8> = Vec::new();
         for &id in ids {
             // A special's text is plain UTF-8, not byte symbols.
-            if let Some((special, _)) = self
-                .specials
-                .iter()
-                .find(|(_, special_id)| *special_id == id)
-            {
-                bytes.extend_from_slice(special.as_bytes());
-                continue;
-            }
-            for chars in self.vocab[id].chars() {
-                bytes.push(self.char_to_byte[&chars]);
-            }
+            self.token_bytes(id, &mut bytes);
         }
         String::from_utf8(bytes)
+    }
+
+    pub fn decode_stream(
+        &self,
+        id: usize,
+        pending: &mut Vec<u8>,
+    ) -> Result<String, std::str::Utf8Error> {
+        self.token_bytes(id, pending);
+        match std::str::from_utf8(pending) {
+            Ok(s) => {
+                let text = s.to_owned();
+                pending.clear();
+                Ok(text)
+            }
+            // `None` means the bytes end mid-character, not that they are invalid.
+            Err(e) if e.error_len().is_none() => {
+                let done: Vec<u8> = pending.drain(..e.valid_up_to()).collect();
+                Ok(String::from_utf8(done).unwrap())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn token_bytes(&self, id: usize, out: &mut Vec<u8>) {
+        if let Some((special, _)) = self
+            .specials
+            .iter()
+            .find(|(_, special_id)| *special_id == id)
+        {
+            out.extend_from_slice(special.as_bytes());
+            return;
+        }
+        for chars in self.vocab[id].chars() {
+            out.push(self.char_to_byte[&chars]);
+        }
     }
 }

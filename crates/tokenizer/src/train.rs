@@ -1,4 +1,4 @@
-use crate::byte_level::{bytes_to_unicode, to_symbols};
+use crate::byte_level::{bytes_to_symbols, bytes_to_unicode};
 use crate::pretokenize::pre_tokenize;
 use fancy_regex::Regex;
 use std::{cmp::Reverse, collections::HashMap};
@@ -13,7 +13,7 @@ pub const TOY_CORPUS: [&str; 4] = [
     "Hopefully, you will be able to understand how they are trained and generate tokens.",
 ];
 
-pub(crate) fn tokenize_bpe(
+pub fn tokenize_bpe(
     corpus: &[&str],
     vocab_size: usize,
     re: &Regex,
@@ -47,7 +47,7 @@ pub(crate) fn tokenize_bpe(
     // We split alphabet and not vocab as special characters are not standardized
     let mut splits: HashMap<&str, Vec<String>> = HashMap::new();
     for word in word_freqs.keys() {
-        splits.insert(word, to_symbols(&byte_symbols, word));
+        splits.insert(word, bytes_to_symbols(&byte_symbols, word));
     }
     // println!("Word[char] Dictionary: {splits:?}\n");
 

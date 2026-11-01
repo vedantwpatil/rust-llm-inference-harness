@@ -8,16 +8,16 @@ For adding agents and subagents to the harness read stage in progress plus [Cros
 
 ## Status
 
-Update in place as work lands. Never delete rows. Estimates are guesses, see [Time estimates](#time-estimates).
+Update in place as work lands. Never delete rows. No time estimates: earlier ones were guesses and were removed 2026-10-27.
 
-| Stage | What                      | Status                                                                                                                    | Estimate                            |
-| ----- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ----------------------------------- |
-| 1     | Tokenizer: byte-level BPE | In progress (trainer, encoder, decoder, special tokens, GPT-2 loader, tiktoken oracle and metrics done; streaming decode and faster encoder left) | 3-5 weeks                           |
-| 2     | GPT-2 small on CPU        | Not started                                                                                                               | 6-10 weeks                          |
-| 3     | Llama-style model + int8  | Not started                                                                                                               | 6-8 weeks                           |
-| 4     | Inference harness traits  | Not started                                                                                                               | 4-6 weeks                           |
-| 5     | Coding harness            | Not started                                                                                                               | 4-8 weeks                           |
-| 6     | Stretch: Metal or serving | Undecided, leaning Metal                                                                                                  | Metal 6-10 weeks, serving 4-8 weeks |
+| Stage | What                      | Status                                                                                                                                            |
+| ----- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1     | Tokenizer: byte-level BPE | In progress (trainer, encoder, decoder, special tokens, GPT-2 loader, tiktoken oracle and metrics done; streaming decode and faster encoder left) |
+| 2     | GPT-2 small on CPU        | Not started                                                                                                                                       |
+| 3     | Llama-style model + int8  | Not started                                                                                                                                       |
+| 4     | Inference harness traits  | Not started                                                                                                                                       |
+| 5     | Coding harness            | Not started                                                                                                                                       |
+| 6     | Stretch: Metal or serving | Undecided, leaning Metal                                                                                                                          |
 
 ## The stack at a glance
 
@@ -153,8 +153,8 @@ decode
 **Done when**
 
 - Ids match tiktoken's `gpt2` encoding on varied corpus: ASCII, code, emoji, CJK, repeated and trailing whitespace, contractions. _Met 2026-10-24: 39 oracle cases plus two benchmark texts (22,200 and 1,000 tokens) match exactly._
-- `decode(encode(s)) == s` for any valid UTF-8, streaming decode never emits half a character. _Round trip met 2026-10-24. Streaming decode not started._
-- Trainer reproduces hand-computed merges on toy corpus like one above. _Partly met: `first_merge_is_space_t` checks the first merge only. The `low`/`lower`/`newest` example above is not a test yet._
+- `decode(encode(s)) == s` for any valid UTF-8, streaming decode never emits half a character. _Met 2026-10-31: round trip 2026-10-24, `decode_stream` holds back a cut character and its output joins to `decode`'s on an emoji, CJK and special-token string._
+- Trainer reproduces hand-computed merges on toy corpus like one above. _Met 2026-10-31: `trains_the_roadmap_toy_merges` checks (w,e) x8 then (l,o) x7. The four-way tie at 6 after that is not asserted, it would test the tie-break._
 
 **Watch for**
 
@@ -166,24 +166,24 @@ decode
 
 **Progress.** Update in place, never delete. Design and mechanics of what exists: [DEVELOPMENT_NOTES.md](DEVELOPMENT_NOTES.md#stage-1-byte-level-bpe-trainer).
 
-| Item                                                                                         | State                                                                                                                                                                                                                                                                                                                                                                                 | Date       |
-| -------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------- |
-| Pre-tokenizer: GPT-2 regex via `fancy-regex`, `pre_tokenize`                                 | Done, 10 tests with expected splits checked against tiktoken's pattern                                                                                                                                                                                                                                                                                                                |            |
-| Bytes to unicode: `bytes_to_unicode`, `[char; 256]` indexed by byte                          | Done, matches GPT-2's reference algorithm on all 256 bytes                                                                                                                                                                                                                                                                                                                            | 2026-10-16 |
-| Trainer: pair counts, best-pair selection, merge, ordered `merges`                           | Done, deterministic, stops at `TOY_VOCAB_SIZE` or when no pair is left                                                                                                                                                                                                                                                                                                                    | 2026-10-16 |
-| Trainer and byte-table tests                                                                 | Done, 8 trainer tests and 2 byte-table tests (20 total in `crates/tokenizer/src/tests.rs`)                                                                                                                                                                                                                                                                                                             | 2026-10-16 |
-| Encoder: replay `merges` by rank per chunk                                                   | Done, `encode_chunk` plus `Tokenizer::encode`                                                                                                                                                                                                                                                                                                                                         | 2026-10-24 |
-| Decoder: ids to bytes to UTF-8                                                               | Done for a whole id list, strict `from_utf8` (a cut codepoint is an `Err`)                                                                                                                                                                                                                                                                                                            | 2026-10-24 |
-| Decoder: streaming hold-back of an incomplete UTF-8 tail                                     | Not started                                                                                                                                                                                                                                                                                                                                                                           |            |
-| Special tokens: `<\|endoftext\|>` cut out before pre-tokenization, never merged              | Done, longest special wins, decode emits its text                                                                                                                                                                                                                                                                                                                                     | 2026-10-24 |
-| Split train from encode: `Tokenizer { vocab, merges, pattern, specials }`                    | Done, `Tokenizer::train` and `Tokenizer::from_gpt2_merges` build one                                                                                                                                                                                                                                                                                                                  | 2026-10-24 |
-| Load GPT-2 as data                                                                           | Done, `crates/tokenizer/data/gpt2/merges.txt` (OpenAI's `vocab.bpe`, sha256 matches tiktoken's pin). No `vocab.json`, ids follow from merges                                                                                                                                                                                                                                           | 2026-10-24 |
-| Oracle test against tiktoken `gpt2`                                                          | Done, 39 cases (ASCII, code, emoji, CJK, whitespace, contractions, specials) from `crates/tokenizer/scripts/gen_oracle.py`, ids match exactly                                                                                                                                                                                                                                                          | 2026-10-24 |
-| Metrics: compression ratio, token counts                                                     | Done in `main`: tokens and bytes per token for word, char, byte, trained BPE, GPT-2 BPE. Word row has unbounded vocab, not comparable. Rows state vocab size and training data: 280 entries from four sentences vs GPT-2's 50,257 is a data and vocab gap, not an algorithm gap                                     | 2026-10-24 |
+| Item                                                                                                          | State                                                                                                                                                                                                                                                                                                                                      | Date       |
+| ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------- |
+| Pre-tokenizer: GPT-2 regex via `fancy-regex`, `pre_tokenize`                                                  | Done, 10 tests with expected splits checked against tiktoken's pattern                                                                                                                                                                                                                                                                     |            |
+| Bytes to unicode: `bytes_to_unicode`, `[char; 256]` indexed by byte                                           | Done, matches GPT-2's reference algorithm on all 256 bytes                                                                                                                                                                                                                                                                                 | 2026-10-16 |
+| Trainer: pair counts, best-pair selection, merge, ordered `merges`                                            | Done, deterministic, stops at `TOY_VOCAB_SIZE` or when no pair is left                                                                                                                                                                                                                                                                     | 2026-10-16 |
+| Trainer and byte-table tests                                                                                  | Done, 8 trainer tests and 2 byte-table tests (20 total in `crates/tokenizer/src/tests.rs`)                                                                                                                                                                                                                                                 | 2026-10-16 |
+| Encoder: replay `merges` by rank per chunk                                                                    | Done, `encode_chunk` plus `Tokenizer::encode`                                                                                                                                                                                                                                                                                              | 2026-10-24 |
+| Decoder: ids to bytes to UTF-8                                                                                | Done for a whole id list, strict `from_utf8` (a cut codepoint is an `Err`)                                                                                                                                                                                                                                                                 | 2026-10-24 |
+| Decoder: streaming hold-back of an incomplete UTF-8 tail | Done, `Tokenizer::decode_stream(id, &mut pending)` returns the completed text and keeps an incomplete tail in `pending`. Invalid bytes are an `Err` and stay in `pending`, the caller clears it. A non-empty `pending` at end of stream is a cut character | 2026-10-31 |
+| Special tokens: `<\|endoftext\|>` cut out before pre-tokenization, never merged                               | Done, longest special wins, decode emits its text                                                                                                                                                                                                                                                                                          | 2026-10-24 |
+| Split train from encode: `Tokenizer { vocab, merges, pattern, specials }`                                     | Done, `Tokenizer::train` and `Tokenizer::from_gpt2_merges` build one                                                                                                                                                                                                                                                                       | 2026-10-24 |
+| Load GPT-2 as data                                                                                            | Done, `crates/tokenizer/data/gpt2/merges.txt` (OpenAI's `vocab.bpe`, sha256 matches tiktoken's pin). No `vocab.json`, ids follow from merges                                                                                                                                                                                               | 2026-10-24 |
+| Oracle test against tiktoken `gpt2`                                                                           | Done, 39 cases (ASCII, code, emoji, CJK, whitespace, contractions, specials) from `crates/tokenizer/scripts/gen_oracle.py`, ids match exactly                                                                                                                                                                                              | 2026-10-24 |
+| Metrics: compression ratio, token counts                                                                      | Done in `main`: tokens and bytes per token for word, char, byte, trained BPE, GPT-2 BPE. Word row has unbounded vocab, not comparable. Rows state vocab size and training data: 280 entries from four sentences vs GPT-2's 50,257 is a data and vocab gap, not an algorithm gap                                                            | 2026-10-24 |
 | Speed benchmarks: `bench_encode_mixed_text`, `bench_encode_one_long_chunk` in `crates/tokenizer/src/tests.rs` | Done, `#[ignore]`d: `cargo test --release bench_ -- --ignored --nocapture`. Each checks token count and id hash against tiktoken. **Baseline** (`String`-based `encode_chunk`): 60 KB mixed text 10.4 ms (5.75 MB/s, 2.1M tokens/s); one 4000-byte chunk 137.9 ms (0.03 MB/s), ~200x slower per byte, cost grows with chunk length squared | 2026-10-24 |
-| Faster `encode_chunk` (plan below)                                                           | Not started                                                                                                                                                                                                                                                                                                                                                                           |            |
-| Tests overall                                                                                | 46 passing plus the 2 ignored benchmarks, clippy clean                                                                                                                                                                                                                                                                                                                                | 2026-10-24 |
-| Cargo workspace: `crates/tokenizer` (lib) and `crates/tokenizer-cli` (bin) | Done, no behavior change: same 45 tests, CLI output, benchmark hashes and timings. Later crates: [Crate map](#crate-map). `Tokenizer.vocab` and `.merges` public for stage 4's id-to-bytes table. _Correction 2026-10-24:_ `vocab` holds GPT-2 symbol chars (`Ġthe`), not raw bytes, so not that table, see **Id-to-bytes table** below | 2026-10-24 |
+| Faster `encode_chunk` (plan below)                                                                            | Not started                                                                                                                                                                                                                                                                                                                                |            |
+| Tests overall | 51 passing plus the 2 ignored benchmarks. Clippy: 2 dead-code warnings in `encode.rs` (`Index`, `Rank` never constructed) | 2026-10-31 |
+| Cargo workspace: `crates/tokenizer` (lib) and `crates/tokenizer-cli` (bin)                                    | Done, no behavior change: same 45 tests, CLI output, benchmark hashes and timings. Later crates: [Crate map](#crate-map). `Tokenizer.vocab` and `.merges` public for stage 4's id-to-bytes table. _Correction 2026-10-24:_ `vocab` holds GPT-2 symbol chars (`Ġthe`), not raw bytes, so not that table, see **Id-to-bytes table** below    | 2026-10-24 |
 
 **Open decisions in stage 1**
 
@@ -413,7 +413,7 @@ Sessions borrow read-only weights, so many can exist at once. Cheap hook for ser
 
 ## Stage 5: Coding harness
 
-**What it is.** Agent loop around model: read task, call tool, see result, repeat until done. Sits behind `Model` trait so same loop can drive local inference (stages 2-4) or hosted API. Starts only after inference pipeline works.
+**What it is.** Agent loop around model: read task, call tool, see result, repeat until done. Drives local inference (stages 2-4) directly, no `Model` trait. _Resolved 2026-10-27: hosted API backend dropped. Original plan: a `Model` trait with local and hosted implementations. Dropped because the goal is local inference depth, and a trait with one implementation has no job. Add the trait later if a second implementation ever exists._ Starts only after inference pipeline works.
 
 ```text
               user task
@@ -427,9 +427,9 @@ Sessions borrow read-only weights, so many can exist at once. Cheap hook for ser
                   │  messages           │
                   ▼                     │
 ╔═══════════════════════════════════╗   │
-║ Model trait                       ║   │
-║ LocalModel (stages 2-4)           ║   │
-║ | HostedModel (API)               ║   │
+║ Local model (stages 2-4)          ║   │
+║ Session + Sampler + grammar mask  ║   │
+║                                   ║   │
 ╚═════════════════╤═════════════════╝   │
                   │  completion         │ result appended
                   ▼                     │
@@ -447,7 +447,7 @@ Sessions borrow read-only weights, so many can exist at once. Cheap hook for ser
 
 **Scope**
 
-- **`Model` trait** with two implementations: local (this project's pipeline) and hosted API.
+- **Local model only.** Loop calls stage 4's `Session` and `Sampler` directly. _Dropped 2026-10-27: `Model` trait with a hosted API implementation._
 - **Context builder:** system prompt, history, tool results. Counts tokens with our tokenizer, trims or summarizes oldest tool output when over budget.
 - **Chat template and special tokens** for local model. Format differs per model. Templates live in `tokenizer` (HF ships them in `tokenizer_config.json` with the specials).
 - **Tool-call parsing:** structured (JSON) calls from model output, with stage 4's grammar constraint on local models.
@@ -456,13 +456,13 @@ Sessions borrow read-only weights, so many can exist at once. Cheap hook for ser
 
 **Done when**
 
-- Completes small real task (for example making failing test pass in toy repo) on both model implementations.
+- Completes small real task (for example making failing test pass in toy repo) on the local model.
 - Never overflows context window.
 - Malformed tool call reported back to model instead of crashing loop.
 
 **Watch for**
 
-- Token counts must match model actually in use. For hosted API, budget from API's reported usage, since its tokenizer differs from ours.
+- Token counts must match model actually in use. Local only, so our tokenizer counts. _Hosted API budgeting (API's reported usage) dropped 2026-10-27._
 - Small local models unreliable at tool-call syntax. Constrain output instead of prompting harder.
 
 **Needs:** stages 1 and 4, and working local model. **Feeds:** nothing, top layer.
@@ -555,17 +555,17 @@ Workspace under `crates/`, split by side, not stage. Text side (`tokenizer`) and
 - Every boundary is a public API to maintain. Return types are the real commitment: arguments can loosen later (`Vec<Vec<u8>>` to `impl IntoIterator<Item = impl AsRef<[u8]>>`) without breaking callers, return types cannot.
 - `inference` never depends on `tokenizer`. Stage 4 needs only tokenizer data (id-to-bytes table, end-of-sequence id), passed in at construction.
 
-| Crate | Stage | Holds | Why a separate crate |
-| --- | --- | --- | --- |
-| `tokenizer` (exists) | 1, 3, 5 | Text side: trainer, encoder, decoder, specials, GPT-2 loader, baselines. Later: id-to-bytes table, streaming decoder, Llama and Qwen vocab loading, chat templates | Foundation. Only `fancy-regex`, plus `serde_json` for `tokenizer.json` |
-| `tokenizer-cli` (exists) | 1 | Demo and comparison report | Binary, display only |
-| `inference` | 2, 3, 4, 6B | Ids side: safetensors loader, GPT-2 and Llama forward passes, KV cache, int8, `Session`, `Sampler`, `LogitProcessor`, `StopCondition` (byte-matched stop strings), grammar masks, generate loop (ids in, ids out), later the batching scheduler. `Backend` and `CpuBackend` as a module until `backend` splits | No tokenizer dependency. Ids in and out is also what tok/s benchmarks measure |
-| `backend` | 6A | `Backend` trait, tensor type, `CpuBackend`, split from `inference` when `metal` starts | `inference` and `metal` depend on it, not on each other: model edits do not rebuild `metal`, Metal tests compare against `CpuBackend` without model code |
-| `harness` | 5 | `Model` trait (local, hosted API), context builder, tool-call parsing, tools, agent loop | Uses `tokenizer` and `inference`. Keeps HTTP and TLS out of the inference path |
-| `metal` | 6A | `MetalBackend` | `unsafe`, Metal bindings, shaders, macOS only. Depends on `backend` only |
-| `server` | 6B | axum handler, request channel, SSE | Uses `tokenizer` and `inference`. Async runtime. Batching scheduler stays in `inference` (needs KV internals) |
-| Grammar (unnamed) | 4, only if it grows | Grammar compiler, token-mask engine | Needs neither model nor tokenizer, like llguidance's separate [`toktrie`](https://docs.rs/toktrie) |
-| Python bindings (unnamed) | any | PyO3 wrapper for benchmarking (see README) | `cdylib` and pyo3 |
+| Crate                     | Stage               | Holds                                                                                                                                                                                                                                                                                                          | Why a separate crate                                                                                                                                     |
+| ------------------------- | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tokenizer` (exists)      | 1, 3, 5             | Text side: trainer, encoder, decoder, specials, GPT-2 loader, baselines. Later: id-to-bytes table, streaming decoder, Llama and Qwen vocab loading, chat templates                                                                                                                                             | Foundation. Only `fancy-regex`, plus `serde_json` for `tokenizer.json`                                                                                   |
+| `tokenizer-cli` (exists)  | 1                   | Demo and comparison report                                                                                                                                                                                                                                                                                     | Binary, display only                                                                                                                                     |
+| `inference`               | 2, 3, 4, 6B         | Ids side: safetensors loader, GPT-2 and Llama forward passes, KV cache, int8, `Session`, `Sampler`, `LogitProcessor`, `StopCondition` (byte-matched stop strings), grammar masks, generate loop (ids in, ids out), later the batching scheduler. `Backend` and `CpuBackend` as a module until `backend` splits | No tokenizer dependency. Ids in and out is also what tok/s benchmarks measure                                                                            |
+| `backend`                 | 6A                  | `Backend` trait, tensor type, `CpuBackend`, split from `inference` when `metal` starts                                                                                                                                                                                                                         | `inference` and `metal` depend on it, not on each other: model edits do not rebuild `metal`, Metal tests compare against `CpuBackend` without model code |
+| `harness`                 | 5                   | Context builder, tool-call parsing, tools, agent loop. _`Model` trait and hosted API dropped 2026-10-27_                                                                                                                                                                                                       | Uses `tokenizer` and `inference`. Agent code stays out of the inference path                                                                             |
+| `metal`                   | 6A                  | `MetalBackend`                                                                                                                                                                                                                                                                                                 | `unsafe`, Metal bindings, shaders, macOS only. Depends on `backend` only                                                                                 |
+| `server`                  | 6B                  | axum handler, request channel, SSE                                                                                                                                                                                                                                                                             | Uses `tokenizer` and `inference`. Async runtime. Batching scheduler stays in `inference` (needs KV internals)                                            |
+| Grammar (unnamed)         | 4, only if it grows | Grammar compiler, token-mask engine                                                                                                                                                                                                                                                                            | Needs neither model nor tokenizer, like llguidance's separate [`toktrie`](https://docs.rs/toktrie)                                                       |
+| Python bindings (unnamed) | any                 | PyO3 wrapper for benchmarking (see README)                                                                                                                                                                                                                                                                     | `cdylib` and pyo3                                                                                                                                        |
 
 ```text
             backend   (Backend trait, tensor type, CpuBackend)
@@ -586,7 +586,7 @@ Stage 2 and 3 demos and benchmarks go in `inference/examples/` with `tokenizer` 
 
 Not planned: `engine` crate (shared text layer between `inference` and consumers). Create only if text wiring repeated in `harness` and `server` grows past a few calls. Streaming decode and chat templates live in `tokenizer`, so it should not.
 
-**Decision: where stage 4 splits.** *Resolved 2026-10-24: all in `inference`, tokenizer passed in as data (option F).* Stage 4 needs the tokenizer's data, not its code. Grammar masks come from token bytes (llguidance builds masks from a trie over vocab bytes). Stop strings match on bytes. End-of-sequence id comes from model config. Only prompt encoding and display decoding need tokenizer code, done by the consumer, as in [vLLM V1](https://docs.vllm.ai/en/latest/design/arch_overview/): engine core returns ids, API server process tokenizes and detokenizes.
+**Decision: where stage 4 splits.** _Resolved 2026-10-24: all in `inference`, tokenizer passed in as data (option F)._ Stage 4 needs the tokenizer's data, not its code. Grammar masks come from token bytes (llguidance builds masks from a trie over vocab bytes). Stop strings match on bytes. End-of-sequence id comes from model config. Only prompt encoding and display decoding need tokenizer code, done by the consumer, as in [vLLM V1](https://docs.vllm.ai/en/latest/design/arch_overview/): engine core returns ids, API server process tokenizes and detokenizes.
 
 - **A, B, C:** original note below.
 - **D:** A, but tokenizer-free (plain data, not `&Tokenizer`). Grew into F.
@@ -608,18 +608,18 @@ What would change it: if `Sampler`, `LogitProcessor`, `StopCondition` work on pl
 
 Where the crate map rests on a prediction. Raise each when its stage starts, before building on it. Resolve in place, never delete.
 
-| Stage | Concern | If it goes the other way |
-| --- | --- | --- |
-| 1, before 2 | Id type (stage 1 open decisions) | Ids are in every crate's API; a late change edits every crate |
-| 1 | Id-to-bytes table missing (stage 1 open decisions) | Streaming decode, grammar masks, stop strings wait on it |
-| 4, at start | Does any stage 4 piece need tokenizer code, not just data? Sketch structs and signatures with `todo!()` bodies first; `cargo check` shows a missing dependency before logic exists | F's premise breaks; revisit B or E |
-| 4 | Sampling stays a separate call after the forward pass, not inside a `Session` step | Folding it in blocks the stage 6A overlap: [XGrammar](https://arxiv.org/abs/2411.15100) builds the mask on CPU during the GPU forward pass, waiting only at sampling |
-| 4 | `Session` return types are the commitment. Logits as borrowed `&[f32]`; caller can `.to_vec()` | Owned-to-borrowed later breaks every caller |
-| 4 | `Session` stays `Send`: compile-only `fn assert_send<T: Send>() {}` test | A private `Rc` or `RefCell` drops `Send` silently; `server` breaks at stage 6 |
-| 4, 6B | Does `Session`'s API survive continuous batching? Stepping many sessions in one forward pass needs KV internals | Scheduler goes in `inference`. If `Session` cannot express batching, rework before stage 5 builds on it |
-| 4 | Grammar code size | Own crate if large |
-| 5, 6B | Text wiring repeated in `harness` and `server` | `engine` if past a few calls |
-| 6A, at start | `backend` split | Move `Backend`, tensor type, `CpuBackend` out of `inference` before `metal`, so `metal` never depends on model code |
+| Stage        | Concern                                                                                                                                                                            | If it goes the other way                                                                                                                                             |
+| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1, before 2  | Id type (stage 1 open decisions)                                                                                                                                                   | Ids are in every crate's API; a late change edits every crate                                                                                                        |
+| 1            | Id-to-bytes table missing (stage 1 open decisions)                                                                                                                                 | Streaming decode, grammar masks, stop strings wait on it                                                                                                             |
+| 4, at start  | Does any stage 4 piece need tokenizer code, not just data? Sketch structs and signatures with `todo!()` bodies first; `cargo check` shows a missing dependency before logic exists | F's premise breaks; revisit B or E                                                                                                                                   |
+| 4            | Sampling stays a separate call after the forward pass, not inside a `Session` step                                                                                                 | Folding it in blocks the stage 6A overlap: [XGrammar](https://arxiv.org/abs/2411.15100) builds the mask on CPU during the GPU forward pass, waiting only at sampling |
+| 4            | `Session` return types are the commitment. Logits as borrowed `&[f32]`; caller can `.to_vec()`                                                                                     | Owned-to-borrowed later breaks every caller                                                                                                                          |
+| 4            | `Session` stays `Send`: compile-only `fn assert_send<T: Send>() {}` test                                                                                                           | A private `Rc` or `RefCell` drops `Send` silently; `server` breaks at stage 6                                                                                        |
+| 4, 6B        | Does `Session`'s API survive continuous batching? Stepping many sessions in one forward pass needs KV internals                                                                    | Scheduler goes in `inference`. If `Session` cannot express batching, rework before stage 5 builds on it                                                              |
+| 4            | Grammar code size                                                                                                                                                                  | Own crate if large                                                                                                                                                   |
+| 5, 6B        | Text wiring repeated in `harness` and `server`                                                                                                                                     | `engine` if past a few calls                                                                                                                                         |
+| 6A, at start | `backend` split                                                                                                                                                                    | Move `Backend`, tensor type, `CpuBackend` out of `inference` before `metal`, so `metal` never depends on model code                                                  |
 
 ---
 
@@ -632,14 +632,6 @@ Where the crate map rests on a prediction. Raise each when its stage starts, bef
 | Tokenizer takes vocabulary, merges, pre-tokenizer pattern as data, not constants.                                                                | Stage 1 | Stage 3           | Llama 3 and Qwen ship own.                                           |
 | Tokenizer exposes id-to-bytes table and streaming-safe decode.                                                                                   | Stage 1 | Stages 4, 5, 6    | Grammar masks, stop strings, SSE streaming all work on partial text. |
 | Reference tokenizers and models = test oracles only, never in code path under test.                                                              | All     | All               | Keeps from-scratch rule honest.                                      |
-| `inference` never depends on `tokenizer`; takes id-to-bytes table and end-of-sequence id as data. | Stage 2 | Stages 4, 6A | Tokenizer edits never rebuild model or `metal`. |
-| Sampling is a separate call after the forward pass. | Stage 4 | Stage 6A | CPU builds grammar mask during GPU forward pass. |
-| Id type settled before ids cross crates. | Stage 1 | All | Ids are in every crate's API. |
-
-## Time estimates
-
-Guesses, not data. Assume 10-15 hours a week while still learning Rust; real number likely 1.5-2x higher.
-
-- Stages 1-5: about 6-9 months (stage 1: 3-5 weeks, stage 2: 6-10, stage 3: 6-8, stage 4: 4-6, stage 5: 4-8).
-- Metal: 6-10 weeks. Serving: 4-8 weeks, plus 3-4 for paged KV. Both: about 3-4.5 months.
-- Everything: about 10-14 months, roughly August to December 2027.
+| `inference` never depends on `tokenizer`; takes id-to-bytes table and end-of-sequence id as data.                                                | Stage 2 | Stages 4, 6A      | Tokenizer edits never rebuild model or `metal`.                      |
+| Sampling is a separate call after the forward pass.                                                                                              | Stage 4 | Stage 6A          | CPU builds grammar mask during GPU forward pass.                     |
+| Id type settled before ids cross crates.                                                                                                         | Stage 1 | All               | Ids are in every crate's API.                                        |

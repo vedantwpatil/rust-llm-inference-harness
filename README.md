@@ -1,4 +1,6 @@
-# Rust Tokenizer
+# Rust LLM Inference Harness
+
+An LLM inference stack built from scratch in Rust: byte-level BPE tokenizer, GPT-2 and Llama-style models on CPU, an inference harness, and a local coding harness on top. Stage 1, the tokenizer, is the current layer.
 
 For my analysis on tokenizers and how I went about my approach [analysis](./docs/RESEARCH.md)
 

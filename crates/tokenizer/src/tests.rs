@@ -1,4 +1,4 @@
-use crate::byte_level::{build_char_to_byte, bytes_to_unicode, to_symbols};
+use crate::byte_level::{build_char_to_byte, bytes_to_symbols, bytes_to_unicode};
 use crate::encode::{build_ranks, build_vocab_ids, encode_chunk};
 use crate::pretokenize::{GPT2_PATTERN, pre_tokenize};
 use crate::{
@@ -137,6 +137,25 @@ fn first_merge_is_space_t() {
     assert_eq!(merges[0], ("\u{120}".to_string(), "t".to_string()));
 }
 
+// The roadmap's worked example: low x5, lower x2, newest x6, one word per line
+// so none gets a leading space. By hand: (w,e) occurs 2 + 6 = 8 times, the
+// next best (l,o) 5 + 2 = 7. After those two, four pairs tie at 6, so only
+// two merges are checked: a third would test the tie-break, not the counting.
+#[test]
+fn trains_the_roadmap_toy_merges() {
+    let mut corpus = vec!["low"; 5];
+    corpus.extend(["lower"; 2]);
+    corpus.extend(["newest"; 6]);
+    let tok = Tokenizer::train(&corpus, START_VOCAB + 2);
+    assert_eq!(
+        tok.merges,
+        [
+            ("w".to_string(), "e".to_string()),
+            ("l".to_string(), "o".to_string())
+        ]
+    );
+}
+
 // The base alphabet is all 256 bytes in byte order, even those the corpus
 // never uses, so the front of the vocab does not depend on the training text.
 #[test]
@@ -215,7 +234,7 @@ fn encode_ids_join_back_to_symbols() {
     for text in ["the tokenizer", " caf\u{e9} \u{1F600}", "x", ""] {
         let ids = tok.encode(text);
         let joined: String = ids.iter().map(|&id| tok.vocab[id].as_str()).collect();
-        assert_eq!(joined, to_symbols(&tok.byte_symbols, text).concat());
+        assert_eq!(joined, bytes_to_symbols(&tok.byte_symbols, text).concat());
     }
 }
 
@@ -306,6 +325,55 @@ fn decode_rejects_a_cut_codepoint() {
     let ids = [1 + 0xC3, 1 + 0xA9];
     assert!(tok.decode(&ids[..1]).is_err());
     assert_eq!(tok.decode(&ids).unwrap(), "\u{e9}");
+}
+
+// Feeds `ids` one at a time, returning each step's output and what is left
+// in `pending`.
+fn stream(tok: &Tokenizer, ids: &[usize]) -> (Vec<String>, Vec<u8>) {
+    let mut pending = Vec::new();
+    let pieces = ids
+        .iter()
+        .map(|&id| tok.decode_stream(id, &mut pending).unwrap())
+        .collect();
+    (pieces, pending)
+}
+
+// "é" is C3 A9: the first id emits nothing and holds C3, the second completes
+// the character.
+#[test]
+fn decode_stream_holds_back_a_cut_codepoint() {
+    let (pieces, pending) = stream(&toy_tokenizer(), &[1 + 0xC3, 1 + 0xA9]);
+    assert_eq!(pieces, ["", "\u{e9}"]);
+    assert!(pending.is_empty());
+}
+
+// A character cut at the end of the stream stays in `pending`.
+#[test]
+fn decode_stream_leaves_an_unfinished_tail_pending() {
+    let tok = toy_tokenizer();
+    let (pieces, pending) = stream(&tok, &[1 + usize::from(b'a'), 1 + 0xC3]);
+    assert_eq!(pieces, ["a", ""]);
+    assert_eq!(pending, [0xC3]);
+}
+
+// 0xFF never appears in UTF-8, so it is invalid at once, not held back.
+#[test]
+fn decode_stream_rejects_invalid_bytes() {
+    let tok = toy_tokenizer();
+    assert!(tok.decode_stream(1 + 0xFF, &mut Vec::new()).is_err());
+}
+
+// Every prefix of a stream decodes to a prefix of the whole decode, and the
+// pieces join to the same text decode gives.
+#[test]
+fn decode_stream_matches_decode() {
+    let tok = toy_tokenizer();
+    let text = "caf\u{e9} \u{1f600} \u{4e2d}\u{6587} <|endoftext|> hi";
+    let ids = tok.encode(text);
+    let (pieces, pending) = stream(&tok, &ids);
+    assert_eq!(pieces.concat(), tok.decode(&ids).unwrap());
+    assert_eq!(pieces.concat(), text);
+    assert!(pending.is_empty());
 }
 
 // Trains on `corpus`, then encodes and decodes `text`. Returns the ids too,

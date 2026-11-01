@@ -1,13 +1,23 @@
-use crate::byte_level::to_symbols;
+use crate::byte_level::bytes_to_symbols;
 use std::collections::HashMap;
 
+// Created structs to make it easier and more maintainable then remembering the specific position of
+// data
+struct Index {
+    i: usize,
+}
+
+struct Rank {
+    r: usize,
+}
+
 // TODO: Optimize this, currently very slow and will show up in the future
-pub(crate) fn encode_chunk(
+pub fn encode_chunk(
     chunk: &str,
     ranks: &HashMap<(String, String), usize>,
     byte_symbols: &[char; 256],
 ) -> Vec<String> {
-    let mut pieces = to_symbols(byte_symbols, chunk);
+    let mut pieces = bytes_to_symbols(byte_symbols, chunk);
     // One key buffer for every lookup: clone_from reuses its allocation.
     let mut key: (String, String) = (String::new(), String::new());
     loop {
@@ -37,7 +47,7 @@ pub(crate) fn encode_chunk(
     pieces
 }
 
-pub(crate) fn build_ranks(merges: &[(String, String)]) -> HashMap<(String, String), usize> {
+pub fn build_ranks(merges: &[(String, String)]) -> HashMap<(String, String), usize> {
     merges
         .iter()
         .enumerate()
@@ -45,7 +55,7 @@ pub(crate) fn build_ranks(merges: &[(String, String)]) -> HashMap<(String, Strin
         .collect()
 }
 
-pub(crate) fn build_vocab_ids(vocab: &[String]) -> HashMap<String, usize> {
+pub fn build_vocab_ids(vocab: &[String]) -> HashMap<String, usize> {
     vocab
         .iter()
         .enumerate()
