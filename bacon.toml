@@ -127,6 +127,29 @@ command = ["cargo", "run", "--example"]
 need_stdout = true
 allow_warnings = true
 
+# Same as `ex`, optimized. Debug builds are far too slow for a model forward pass.
+# Call it as
+#    bacon ex-release -- my-example
+[jobs.ex-release]
+command = ["cargo", "run", "--release", "--example"]
+need_stdout = true
+allow_warnings = true
+
+# The #[ignore]d benchmarks (tests named bench_*), release only.
+# need_stdout is on so --nocapture's timings reach the screen.
+[jobs.bench]
+command = [
+  "cargo",
+  "test",
+  "--workspace",
+  "--release",
+  "bench_",
+  "--",
+  "--ignored",
+  "--nocapture",
+]
+need_stdout = true
+
 # Created this custom job as a extension of the run job to better understand how to create custom bacon jobs 
 [jobs.tok]
 command = [
