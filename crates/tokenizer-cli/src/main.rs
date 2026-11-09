@@ -69,7 +69,7 @@ fn main() -> Result<(), String> {
     println!("{} tokens", ids.len());
     println!("  {:>3}  {:>5}  token", "pos", "id");
     for (pos, &id) in ids.iter().enumerate().take(PREVIEW) {
-        println!("  {pos:>3}  {id:>5}  {:?}", tokenizer.vocab[id]);
+        println!("  {pos:>3}  {id:>5}  {:?}", tokenizer.vocab[id as usize]);
     }
     if ids.len() > PREVIEW {
         println!("  ... +{} more", ids.len() - PREVIEW);

@@ -233,7 +233,7 @@ fn encode_ids_join_back_to_symbols() {
     let tok = toy_tokenizer();
     for text in ["the tokenizer", " caf\u{e9} \u{1F600}", "x", ""] {
         let ids = tok.encode(text);
-        let joined: String = ids.iter().map(|&id| tok.vocab[id].as_str()).collect();
+        let joined: String = ids.iter().map(|&id| tok.vocab[id as usize].as_str()).collect();
         assert_eq!(joined, bytes_to_symbols(&tok.byte_symbols, text).concat());
     }
 }
@@ -306,7 +306,7 @@ fn decode_of_no_ids_is_empty() {
 #[test]
 fn decode_mixes_merged_and_byte_tokens() {
     let tok = toy_tokenizer();
-    let ids = [tok.vocab_ids["\u{120}t"], 1 + usize::from(b'o')];
+    let ids = [tok.vocab_ids["\u{120}t"], 1 + u32::from(b'o')];
     assert_eq!(tok.decode(&ids).unwrap(), " to");
 }
 
@@ -329,7 +329,7 @@ fn decode_rejects_a_cut_codepoint() {
 
 // Feeds `ids` one at a time, returning each step's output and what is left
 // in `pending`.
-fn stream(tok: &Tokenizer, ids: &[usize]) -> (Vec<String>, Vec<u8>) {
+fn stream(tok: &Tokenizer, ids: &[u32]) -> (Vec<String>, Vec<u8>) {
     let mut pending = Vec::new();
     let pieces = ids
         .iter()
@@ -351,7 +351,7 @@ fn decode_stream_holds_back_a_cut_codepoint() {
 #[test]
 fn decode_stream_leaves_an_unfinished_tail_pending() {
     let tok = toy_tokenizer();
-    let (pieces, pending) = stream(&tok, &[1 + usize::from(b'a'), 1 + 0xC3]);
+    let (pieces, pending) = stream(&tok, &[1 + u32::from(b'a'), 1 + 0xC3]);
     assert_eq!(pieces, ["a", ""]);
     assert_eq!(pending, [0xC3]);
 }
@@ -378,7 +378,7 @@ fn decode_stream_matches_decode() {
 
 // Trains on `corpus`, then encodes and decodes `text`. Returns the ids too,
 // so tests can look at how the text was split.
-fn round_trip(corpus: &[&str], vocab_size: usize, text: &str) -> (Vec<usize>, String) {
+fn round_trip(corpus: &[&str], vocab_size: usize, text: &str) -> (Vec<u32>, String) {
     let tok = Tokenizer::train(corpus, vocab_size);
     let ids = tok.encode(text);
     let decoded = tok.decode(&ids).unwrap();
@@ -505,7 +505,7 @@ fn gpt2() -> Tokenizer {
 }
 
 // Expected ids come from tiktoken's gpt2 encoding, see scripts/gen_oracle.py.
-const ORACLE: &[(&str, &[usize])] = include!("../data/gpt2/oracle_cases.in");
+const ORACLE: &[(&str, &[u32])] = include!("../data/gpt2/oracle_cases.in");
 
 // Built from merges.txt alone, the ids must land where GPT-2 puts them.
 #[test]
@@ -565,7 +565,7 @@ const BENCH_REPEATS: usize = 50;
 const BENCH_EXPECTED: [(usize, u64); 2] = include!("../data/gpt2/bench_expected.in");
 
 // FNV-1a over the ids, the same rule as fnv() in scripts/gen_oracle.py.
-fn fnv(ids: &[usize]) -> u64 {
+fn fnv(ids: &[u32]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for &id in ids {
         h = (h ^ id as u64).wrapping_mul(0x0100_0000_01b3);

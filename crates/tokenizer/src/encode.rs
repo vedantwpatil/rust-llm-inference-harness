@@ -1,16 +1,6 @@
 use crate::byte_level::bytes_to_symbols;
 use std::collections::HashMap;
 
-// Created structs to make it easier and more maintainable then remembering the specific position of
-// data
-struct Index {
-    i: usize,
-}
-
-struct Rank {
-    r: usize,
-}
-
 // TODO: Optimize this, currently very slow and will show up in the future
 pub fn encode_chunk(
     chunk: &str,
@@ -55,10 +45,10 @@ pub fn build_ranks(merges: &[(String, String)]) -> HashMap<(String, String), usi
         .collect()
 }
 
-pub fn build_vocab_ids(vocab: &[String]) -> HashMap<String, usize> {
+pub fn build_vocab_ids(vocab: &[String]) -> HashMap<String, u32> {
     vocab
         .iter()
         .enumerate()
-        .map(|(id, token)| (token.clone(), id))
+        .map(|(id, token)| (token.clone(), u32::try_from(id).unwrap()))
         .collect()
 }
