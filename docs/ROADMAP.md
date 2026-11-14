@@ -8,8 +8,6 @@ For adding agents and subagents to the harness read stage in progress plus [Cros
 
 ## Status
 
-Update in place as work lands. Never delete rows. No time estimates: earlier ones were guesses and were removed 2026-10-27.
-
 | Stage | What                      | Status                                                                                                                                            |
 | ----- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 1     | Tokenizer: byte-level BPE | In progress (trainer, encoder, decoder, special tokens, GPT-2 loader, tiktoken oracle and metrics done; streaming decode and faster encoder left) |

@@ -4,7 +4,7 @@ An LLM inference stack built from scratch in Rust: byte-level BPE tokenizer, GPT
 
 For my analysis on tokenizers and how I went about my approach [analysis](./docs/RESEARCH.md)
 
-For the development plan and next steps on this repo look at [roadmap](/docs/ROADMAP.md)
+For the development plan and next steps on this repo look at (AI assisted) [roadmap](/docs/ROADMAP.md)
 
 ## Layout
 
@@ -20,6 +20,8 @@ Cargo workspace, one crate per layer of the stack. Today:
 Plan to implement multiple types of tokenizers and experiment with "outdated" tokenizers before building a [BPE](./docs/RESEARCH.md#bpe-byte-pair-encoding) tokenizer from scratch
 
 The main goal of this is to be able to learn about how the inference pipeline works in a lot of common machine learning pipelines. The way that we'll learn this is by first creating a tokenizer, then creating the respective components around the tokenizer to feed into a model to do inference and then finally use this inference pipeline to create my own harness. Everything should be created from scratch and in rust with writing some bindings to python to be able to call some of the crates for performance testing against other inference pipelines.
+
+Docs are AI assisted with blog posts linked, code is written from hand
 
 ### Personal Notes
 
