@@ -1,47 +1,8 @@
 # Development Notes
 
-Related docs: [CLAUDE.md](../CLAUDE.md) (conventions, learning context), [ROADMAP.md](ROADMAP.md) (stages, progress, open decisions), [ARCHITECTURE.md](ARCHITECTURE.md) (tokenizer pipeline overview), [RESEARCH.md](RESEARCH.md) (tokenizer research notes), [RUST_NOTES.md](RUST_NOTES.md) (Rust mechanics met along the way).
+Why the tokenizer is built the way it is: reasoning, cost, measured baselines. Structure and data flow: [ARCHITECTURE.md](ARCHITECTURE.md). Plan and open decisions: [ROADMAP.md](ROADMAP.md). Deep dives: [CHARS_VS_BYTES.md](CHARS_VS_BYTES.md), [I32_VS_U32.md](I32_VS_U32.md). Rust mechanics: [RUST_NOTES.md](RUST_NOTES.md).
 
-Technical write-ups of what has been built, per stage, with reasoning and open questions. Library: `crates/tokenizer` (modules `baseline`, `byte_level`, `pretokenize`, `train`, `encode`, `tokenizer`, `metrics`, tests in `src/tests.rs`). Demo binary: `crates/tokenizer-cli`. Before 2026-10-24 everything lived in `src/main.rs`; the split did not change the behavior described below.
-
-## Stage 1: byte-level BPE trainer
-
-Status: stage 1 complete (trainer, encoder, decoder with streaming, specials, GPT-2 loader, tiktoken oracle). Only the trainer is written up below; the encoder, `Tokenizer` and oracle have one-line entries in [Progress](#progress). Open decisions: [ROADMAP.md](ROADMAP.md#stage-1-tokenizer-byte-level-bpe) and [Known limitations and open decisions](#known-limitations-and-open-decisions) below.
-
-### Data flow
-
-```text
-corpus: Vec<&str>
-   │  pre_tokenize (GPT-2 regex, runs on the raw text)
-   ▼
-word_freqs: HashMap<&str, u32>        chunk -> occurrences in corpus
-   │  chunk.bytes() -> bytes_to_unicode table
-   ▼
-splits: HashMap<&str, Vec<String>>    chunk -> its current symbols
-   │
-   │  loop until vocab.len() == vocab_size or no pair is left
-   │    compute_pair_freqs(&splits, &word_freqs) -> HashMap<(String, String), u32>
-   │    best pair = max by (count, then smallest pair)
-   │    merge_pairs(a, b, &mut splits)            rewrites every chunk in place
-   │    merges.push(best_pair); vocab.push(a + b)
-   ▼
-(vocab: Vec<String>, merges: Vec<(String, String)>)
-```
-
-### Output contract
-
-`tokenize_bpe(corpus: &[&str], vocab_size: usize)` returns `(vocab, merges)`.
-
-| Index                               | Content                                                     |
-| ----------------------------------- | ----------------------------------------------------------- |
-| `vocab[0]`                          | `<\|endoftext\|>`, special token, never produced by a merge |
-| `vocab[1 + b]` for `b` in `0..=255` | the symbol for byte `b`, which is `bytes_to_unicode()[b]`   |
-| `vocab[257 + i]`                    | `merges[i].0 + merges[i].1`, the token merge `i` created    |
-
-- A token's id is its index in `vocab`.
-- A merge's rank is its index in `merges`, the order merges were learned. The encoder replays them in that order, so the order is part of the trained artifact. Hence `Vec`, not `HashMap`: training never looks a merge up, and a map would lose the order. The encoder builds `pair -> rank` and `token -> id` maps from the two vectors at load.
-- `vocab[257 + i] == format!("{a}{b}")` for `merges[i] == (a, b)`, guarded by `vocab_and_merges_stay_aligned`.
-- Starting size is 257, so `TOY_VOCAB_SIZE = 280` learns 23 merges.
+## Stage 1: byte-level BPE
 
 ### Pre-tokenizer
 
@@ -60,17 +21,9 @@ Consequences for training:
 - The other 68 (control characters, space, `0x7F..=0xA0`, `0xAD`) get `U+0100`, `U+0101`, ... in byte order, ending at `U+0143`: `0x00` is `Ā` (`U+0100`), newline `Ċ` (`U+010A`), space `Ġ` (`U+0120`), `0xAD` `Ń` (`U+0143`).
 - The `shifted` counter advancing in byte order makes the table identical to GPT-2's. Any other order is a valid bijection but would not match GPT-2's `vocab.json` and `merges.txt`.
 
-Why this representation:
+Why bytes instead of characters, and why this table: [CHARS_VS_BYTES.md](CHARS_VS_BYTES.md).
 
-- **One byte, one `char`.** Closed 256-symbol alphabet: any input representable, no unknown token. Starting from `char`s (about 1.1 million values) makes the base alphabet corpus-dependent and open-ended.
-- **Not decimal strings.** Decimal text per byte makes merges ambiguous: `"1"` + `"16"` = `"116"`, also the symbol for byte 116 (`t`). One char per byte keeps concatenation unambiguous.
-- **Printable, no whitespace.** Tokens store and print as plain text. `byte_table_is_distinct_and_printable` checks this and that all 256 chars are distinct, which makes the table reversible for decoding.
-- **Pre-tokenize first, map second.** All 68 shifted symbols are Latin Extended-A letters (`\p{L}`). Mapping before the regex turns spaces into letters, `\s` never matches, and the text collapses into one letter run. So the mapping runs afterwards, per byte of each chunk.
-- **Always the full alphabet.** All 256 symbols enter `vocab` whatever the corpus. The first 257 entries are identical for every training text, and a byte the corpus never showed still encodes.
-
-The fixed table also means the base alphabet no longer comes from iterating a `HashMap`, so it is deterministic.
-
-Multi-byte characters become several symbols: `é` (two UTF-8 bytes) starts as `Ã` and `©`, an emoji as four symbols. A merged token is a byte sequence and can end mid-character, hence the decoder's hold-back buffer (see [Decoder](#decoder)).
+All 256 entries were compared once against a Python port of GPT-2's `bytes_to_unicode`. The tests check five known entries plus bijectivity and printability, and the tiktoken oracle test covers the rest.
 
 ### Training loop
 
@@ -84,7 +37,7 @@ State: `word_freqs` (fixed), `splits` (rewritten each merge), `vocab`, `merges`.
 
 `while vocab.len() < vocab_size` stops at the target size.
 
-**Selection is order-independent.** `HashMap` has a per-instance random seed, so iteration order differs between maps and between runs, and "first pair seen with the max count" picks different merges per run. Max under `(count, smaller pair)` is a total order, so the winner does not depend on iteration order. `training_is_deterministic` trains twice and compares. HF's Python course is deterministic only because dicts keep insertion order, so its tie-break differs: on the toy corpus `("e", "r")`, `("i", "s")` and `("Ġ", "a")` all occur 5 times. This repo takes them in pair byte order (`er`, `is`, `Ġa`), the course takes `is` before `er`. Only the first merge, `("Ġ", "t")` with 7 occurrences (` the`, ` tokenization`, ` tokenizer`, ` to`, ` they`, ` trained`, ` tokens`), has no tie.
+**Selection is order-independent.** `HashMap` has a per-instance random seed, so iteration order differs between maps and between runs, and "first pair seen with the max count" picks different merges per run. Max under `(count, smaller pair)` is a total order, so the winner does not depend on iteration order. `training_is_deterministic` trains twice and compares. HF's Python course is deterministic only because dicts keep insertion order, so its tie-break differs: on the toy corpus `("e", "r")`, `("i", "s")` and `("Ġ", "a")` all occur 5 times. This repo takes them in pair byte order (`er`, `is`, `Ġa`), the course takes `is` before `er`. Only the first merge, `("Ġ", "t")` with 7 occurrences (` the`, ` tokenization`, ` tokenizer`, ` to`, ` they`, ` trained`, ` tokens`), has no tie. The difference affects trained artifacts only, not encoding with published GPT-2 merges.
 
 **Merge semantics.** `merge_pairs` scans each chunk left to right. On a match at `i` it writes the concatenation to `split[i]`, removes `split[i + 1]`, and does not advance `i`, so the new symbol is compared with its right neighbour next. Matches never overlap: `["a","a","a"]` under `("a","a")` becomes `["aa","a"]`, four `a`s become `["aa","aa"]`. The encoder must use the same left-to-right greedy order, or trained and encode-time merges disagree.
 
@@ -94,14 +47,14 @@ Every iteration recounts all pairs from scratch.
 
 - `compute_pair_freqs` is linear in total symbols across unique chunks, but clones each chunk's `Vec<String>` and both strings of every window, so it is allocation heavy.
 - `merge_pairs` is linear in the same total, quadratic in chunk length worst case (`Vec::remove` shifts the tail).
-- Total is about `merges × symbols`. Fine for the toy corpus, wrong shape for a real one. Standard fix: incremental pair counts, updating only chunks a merge touched, with a heap for the argmax. Not done: correctness first, per [CLAUDE.md](../CLAUDE.md).
-- Pair counts are `u32` and overflow past about 4.29e9 occurrences of one pair.
+- Total is about `merges × symbols`. Fine for the toy corpus, wrong shape for a real one. Standard fix: incremental pair counts, updating only chunks a merge touched, with a heap for the argmax. Not done: correctness comes before speed here.
+- Pair counts are `u32`: type choice and overflow behavior in [I32_VS_U32.md](I32_VS_U32.md).
 
 ### Decoder
 
 `Tokenizer::token_bytes(id, out: &mut Vec<u8>)` appends one id's bytes to `out`. A special's text is plain UTF-8, so it is looked up first (`specials`, linear scan) and copied whole. Any other id's `vocab` entry is symbol chars, each mapped back to a byte through `char_to_byte`. It appends instead of returning a `Vec` so no allocation happens per token.
 
-- **`decode(&[usize]) -> Result<String, FromUtf8Error>`** calls `token_bytes` for every id into one `Vec<u8>` and runs `String::from_utf8` once at the end. A merged token can end mid-character, so converting per token would fail on valid input. A cut character at the very end is an `Err`.
+- **`decode(&[u32]) -> Result<String, FromUtf8Error>`** calls `token_bytes` for every id into one `Vec<u8>` and runs `String::from_utf8` once at the end. A merged token can end mid-character, so converting per token would fail on valid input. A cut character at the very end is an `Err`.
 - **`decode_stream(id, &mut pending) -> Result<String, Utf8Error>`** appends the id's bytes to `pending`, then `std::str::from_utf8(pending)`:
   - `Ok(s)`: everything is complete. Return it, clear `pending`.
   - `Err(e)` with `e.error_len() == None`: the bytes end mid-character. Drain the first `e.valid_up_to()` bytes out of `pending` and return them as text, the tail stays for the next call.
@@ -110,56 +63,13 @@ Every iteration recounts all pairs from scratch.
 - **End of stream.** A non-empty `pending` is a cut character. There is no flush method: the caller decides whether that is an error.
 - **Error type.** `decode_stream` returns `Utf8Error` (from `str::from_utf8` on a slice), `decode` returns `FromUtf8Error` (from `String::from_utf8`, which owns the `Vec`).
 
-Tests: `decode_stream_holds_back_a_cut_codepoint`, `decode_stream_leaves_an_unfinished_tail_pending`, `decode_stream_rejects_invalid_bytes` (`0xFF` can start no UTF-8 sequence, so `error_len()` is `Some`), `decode_stream_matches_decode`.
+### Compression metrics
 
-### Known limitations and open decisions
+`main` prints tokens and bytes per token for word, char, byte, trained BPE and GPT-2 BPE. The word row has an unbounded vocab, so it is not comparable with the others. Rows state vocab size and training data: 280 entries from four sentences against GPT-2's 50,257 is a data and vocab gap, not an algorithm gap.
 
-Resolved items stay in place, marked resolved. Never delete.
+### Benchmarks
 
-- **Resolved (2026-10-22): corpus selection.** `tokenize_bpe(prompt)` trained on the prompt if over 100 bytes, else on four HF course sentences, at the fixed `VOCAB_SIZE`. Corpus and `vocab_size` are now arguments. `main` still applies the 100-byte rule, passing `TOY_CORPUS` or the prompt, with `VOCAB_SIZE` as its default. The `Tokenizer { vocab, merges, pattern }` struct is still to come.
-- **Resolved (2026-10-24, see ROADMAP): id layout differs from GPT-2.** Each constructor picks its layout; `from_gpt2_merges` matches GPT-2's. Trained tokenizers keep the layout below. Original note: Bytes sit in byte order after `<|endoftext|>`. GPT-2 puts the 188 printable bytes first, then the 68 shifted ones, then merges, then `<|endoftext|>` at 50256. There `Ġ` is 220 and the first merge `Ġt` 256; here `Ġ` is 33. Matching tiktoken needs GPT-2's base order or a remap in the oracle test.
-- **Open: tie-break differs from reference trainers.** See above. Affects trained artifacts only, not encoding with published GPT-2 merges.
-- **Resolved (2026-10-24): no encoder or decoder.** `encode_chunk`, `Tokenizer::encode` and `Tokenizer::decode` replay merges on new text. Streaming decode followed on 2026-10-31, see Decoder below.
-- **Open: table verified against a Python port, not in-repo.** A one-time check compared all 256 entries with a Python port of GPT-2's `bytes_to_unicode`. Tests check five known entries plus bijectivity and printability. The tiktoken oracle test will cover the rest.
-- **Resolved: nondeterministic merges.** Caused by `HashMap` iteration with a strict `>` and no tie-break, and by an alphabet collected from a `HashMap`. Fixed by the `(count, pair)` total order and the fixed byte table.
-- **Resolved: decimal-string byte symbols.** Rejected for the merge ambiguity above, replaced by the GPT-2 table.
+`bench_encode_mixed_text` and `bench_encode_one_long_chunk` in `crates/tokenizer/src/tests.rs` are `#[ignore]`d and each checks its token count and id hash against tiktoken. Baseline with the `String`-based `encode_chunk`:
 
-### Tests
-
-The table covers the 20 trainer-stage tests in `crates/tokenizer/src/tests.rs` (51 in total now, including encoder, oracle, decoder and streaming tests, `trains_the_roadmap_toy_merges` among them). The first 10 cover the pre-tokenizer (splits checked against tiktoken's pattern), the rest the byte table and trainer. Most trainer tests use `train()`, which trains `TOY_CORPUS` at `TOY_VOCAB_SIZE` via `Tokenizer::train`. The last two pass their own text as a one-element corpus.
-
-| Test                                      | What it guards                                                                                          |
-| ----------------------------------------- | ------------------------------------------------------------------------------------------------------- |
-| `byte_table_matches_gpt2`                 | space is `Ġ`, newline is `Ċ`, `a` maps to itself, byte 0 is `Ā`, byte 255 is `ÿ`                        |
-| `byte_table_is_distinct_and_printable`    | 256 distinct chars, none control or whitespace, so the table is reversible                              |
-| `first_merge_is_space_t`                  | first merge is `("Ġ", "t")`, the only pair with count 7, so no tie-break dependence                     |
-| `base_alphabet_is_all_256_bytes`          | `vocab[0]` is the special token and `vocab[1 + b]` is the table entry for every byte                    |
-| `trains_to_target_vocab_size`             | `vocab.len() == TOY_VOCAB_SIZE` and `merges.len() == TOY_VOCAB_SIZE - 257`                                      |
-| `no_empty_tokens`                         | no empty token or empty half of a merge                                                                 |
-| `vocab_and_merges_stay_aligned`           | `vocab[257 + i]` is the concatenation of `merges[i]`                                                    |
-| `training_is_deterministic`               | two runs return identical `(vocab, merges)`                                                             |
-| `non_ascii_corpus_uses_only_byte_symbols` | with `é` and an emoji in the corpus, every char in every token (past the special token) is a table char |
-| `stops_when_no_pairs_remain`              | 101 identical letters train down to one token and stop before `TOY_VOCAB_SIZE`                              |
-
-### Progress
-
-Update in place, never delete. Moved here from [ROADMAP.md](ROADMAP.md#stage-1-tokenizer-byte-level-bpe) on 2026-11-06 so status sits with the design of what exists. Scope, done-when and open decisions stay in the ROADMAP. Test and lint status are not recorded in docs: run `cargo test` and `cargo clippy`.
-
-| Item                                                                                                          | State                                                                                                                                                                                                                                                                                                                                      | Date       |
-| ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ---------- |
-| Pre-tokenizer: GPT-2 regex via `fancy-regex`, `pre_tokenize`                                                  | Done, tests check the expected splits against tiktoken's pattern                                                                                                                                                                                                                                                                     |            |
-| Bytes to unicode: `bytes_to_unicode`, `[char; 256]` indexed by byte                                           | Done, matches GPT-2's reference algorithm on all 256 bytes                                                                                                                                                                                                                                                                                 | 2026-10-16 |
-| Trainer: pair counts, best-pair selection, merge, ordered `merges`                                            | Done, deterministic, stops at `TOY_VOCAB_SIZE` or when no pair is left                                                                                                                                                                                                                                                                     | 2026-10-16 |
-| Trainer and byte-table tests                                                                                  | Done, trainer and byte-table tests in `crates/tokenizer/src/tests.rs`                                                                                                                                                                                                                                                 | 2026-10-16 |
-| Encoder: replay `merges` by rank per chunk                                                                    | Done, `encode_chunk` plus `Tokenizer::encode`                                                                                                                                                                                                                                                                                              | 2026-10-24 |
-| Decoder: ids to bytes to UTF-8                                                                                | Done for a whole id list, strict `from_utf8` (a cut codepoint is an `Err`)                                                                                                                                                                                                                                                                 | 2026-10-24 |
-| Decoder: streaming hold-back of an incomplete UTF-8 tail | Done, `Tokenizer::decode_stream(id, &mut pending)` returns the completed text and keeps an incomplete tail in `pending`. Invalid bytes are an `Err` and stay in `pending`, the caller clears it. A non-empty `pending` at end of stream is a cut character | 2026-10-31 |
-| Special tokens: `<\|endoftext\|>` cut out before pre-tokenization, never merged                               | Done, longest special wins, decode emits its text                                                                                                                                                                                                                                                                                          | 2026-10-24 |
-| Split train from encode: `Tokenizer { vocab, merges, pattern, specials }`                                     | Done, `Tokenizer::train` and `Tokenizer::from_gpt2_merges` build one                                                                                                                                                                                                                                                                       | 2026-10-24 |
-| Load GPT-2 as data                                                                                            | Done, `crates/tokenizer/data/gpt2/merges.txt` (OpenAI's `vocab.bpe`, sha256 matches tiktoken's pin). No `vocab.json`, ids follow from merges                                                                                                                                                                                               | 2026-10-24 |
-| Oracle test against tiktoken `gpt2`                                                                           | Done, cases (ASCII, code, emoji, CJK, whitespace, contractions, specials) from `crates/tokenizer/scripts/gen_oracle.py`, ids match exactly                                                                                                                                                                                              | 2026-10-24 |
-| Metrics: compression ratio, token counts                                                                      | Done in `main`: tokens and bytes per token for word, char, byte, trained BPE, GPT-2 BPE. Word row has unbounded vocab, not comparable. Rows state vocab size and training data: 280 entries from four sentences vs GPT-2's 50,257 is a data and vocab gap, not an algorithm gap                                                            | 2026-10-24 |
-| Speed benchmarks: `bench_encode_mixed_text`, `bench_encode_one_long_chunk` in `crates/tokenizer/src/tests.rs` | Done, `#[ignore]`d: `cargo test --release bench_ -- --ignored --nocapture`. Each checks token count and id hash against tiktoken. **Baseline** (`String`-based `encode_chunk`): 60 KB mixed text 10.4 ms (5.75 MB/s, 2.1M tokens/s); one 4000-byte chunk 137.9 ms (0.03 MB/s), ~200x slower per byte, cost grows with chunk length squared | 2026-10-24 |
-| Faster `encode_chunk` (plan: open decision "Encoder speed" in [ROADMAP.md](ROADMAP.md#stage-1-tokenizer-byte-level-bpe))                                                                            | Not started                                                                                                                                                                                                                                                                                                                                |            |
-| Tests and lint status | Not recorded here: run `cargo test` and `cargo clippy` | |
-| Cargo workspace: `crates/tokenizer` (lib) and `crates/tokenizer-cli` (bin)                                    | Done, no behavior change: same 45 tests, CLI output, benchmark hashes and timings. Later crates: [Crate map](ROADMAP.md#crate-map). `Tokenizer.vocab` and `.merges` public for stage 4's id-to-bytes table. _Correction 2026-10-24:_ `vocab` holds GPT-2 symbol chars (`Ġthe`), not raw bytes, so not that table, see the open decision **Id-to-bytes table** in [ROADMAP.md](ROADMAP.md#stage-1-tokenizer-byte-level-bpe)    | 2026-10-24 |
+- 60 KB mixed text: 10.4 ms (5.75 MB/s, 2.1M tokens/s).
+- One 4000-byte chunk: 137.9 ms (0.03 MB/s), about 200x slower per byte, because cost grows with chunk length squared.

@@ -1,6 +1,6 @@
 # Chars vs bytes as BPE base symbols
 
-Related docs: [RESEARCH.md](RESEARCH.md#chars-vs-bytes) (short summary), [DEVELOPMENT_NOTES.md](DEVELOPMENT_NOTES.md#bytes-to-unicode) (trainer write-up), [CLAUDE.md](../CLAUDE.md) (conventions).
+Table facts (which bytes map where): [DEVELOPMENT_NOTES.md](DEVELOPMENT_NOTES.md#bytes-to-unicode).
 
 The Hugging Face course starts BPE from the characters in the corpus. This project starts from the 256 byte values: `tokenize_bpe` splits each chunk with `.bytes()`, not `.chars()`, and maps each byte to a symbol through the fixed `bytes_to_unicode` table. All 256 symbols are always in the base vocabulary.
 
@@ -61,24 +61,11 @@ Tokens are byte sequences, not text. One can end mid-character, so the decoder c
 
 ## Why a mapping table
 
-The table maps each byte to one `char`. Decimal text per byte would make merges ambiguous: `"1"` + `"16"` = `"116"`, also the symbol for byte 116. 188 bytes map to themselves, the other 68 to `U+0100` and up, so space becomes `Ġ` and newline `Ċ`. See [Bytes to unicode](DEVELOPMENT_NOTES.md#bytes-to-unicode).
+`bytes_to_unicode` (`crates/tokenizer/src/byte_level.rs`) maps each byte to one `char`, so space becomes `Ġ` and newline `Ċ`. Three reasons:
 
-```rust
-fn bytes_to_unicode() -> [char; 256] {
-    let mut table = ['\0'; 256];
-    let mut shifted = 0;
-    for b in 0..=u8::MAX {
-        table[usize::from(b)] = if matches!(b, b'!'..=b'~' | 0xA1..=0xAC | 0xAE..=0xFF) {
-            char::from(b)
-        } else {
-            let c = char::from_u32(256 + shifted).expect("below the surrogate range");
-            shifted += 1;
-            c
-        };
-    }
-    table
-}
-```
+- **Not decimal strings.** Decimal text per byte makes merges ambiguous: `"1"` + `"16"` = `"116"`, also the symbol for byte 116 (`t`). One char per byte keeps concatenation unambiguous.
+- **Printable, no whitespace.** Tokens store and print as plain text. `byte_table_is_distinct_and_printable` checks this and that all 256 chars are distinct, which makes the table reversible for decoding.
+- **Always the full alphabet.** All 256 symbols enter `vocab` whatever the corpus. The first 257 entries are identical for every training text, and a byte the corpus never showed still encodes.
 
 ## Order of operations
 
