@@ -133,3 +133,5 @@ Something I'm referencing as I'm learning more about this
 [hugging face llm course (tokenizers chapter)](https://huggingface.co/learn/llm-course/chapter6/5)
 
 Great [video ](https://youtu.be/_xM8scs4_x4) explaining the current state of LLM inference providers. Helps explain the question of what is the llm inference service that is provided
+
+[simd blog](https://mitchellh.com/writing/everyone-should-know-simd)

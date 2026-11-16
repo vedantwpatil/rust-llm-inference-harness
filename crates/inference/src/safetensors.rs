@@ -27,8 +27,10 @@ pub fn load(path: &Path) -> HashMap<String, (Vec<usize>, Vec<f32>)> {
         assert_eq!(end - begin, shape.iter().product::<usize>() * 4);
 
         let values: Vec<f32> = data[begin..end]
-            .chunks_exact(4)
-            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| f32::from_le_bytes(*chunk))
             .collect();
         tensors.insert(name.clone(), (shape, values));
     }
