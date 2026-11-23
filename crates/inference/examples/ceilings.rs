@@ -6,8 +6,10 @@
 //!
 //! shortcut: aarch64 only, it times NEON instructions.
 //!
-//! It also measures the other ceiling: how fast the cores can stream memory.
+//! It also measures how fast the cores can stream memory, and what one empty
+//! parallel region of the thread pool costs.
 
+use inference::pool::Pool;
 use std::arch::aarch64::*;
 use std::hint::black_box;
 use std::sync::Barrier;
@@ -177,8 +179,68 @@ fn sum(x: &[f32]) -> f32 {
     }
 }
 
+/// Microseconds for a parallel region whose tasks do nothing: the fixed price of
+/// each of the ~100 dependent regions in a decoded token.
+fn region_cost(threads: usize) -> f64 {
+    let pool = Pool::new(threads);
+    let tasks = threads * 4;
+    let work = |_: usize| {
+        black_box(0);
+    };
+    for _ in 0..1000 {
+        pool.run(tasks, &work);
+    }
+    let n = 20_000;
+    let start = Instant::now();
+    for _ in 0..n {
+        pool.run(tasks, &work);
+    }
+    start.elapsed().as_secs_f64() * 1e6 / n as f64
+}
+
+/// GB/s of parallel regions that each stream one cold slice of `data`, the way
+/// a decoded token streams one weight matrix: the slice is cut into
+/// `threads * 4` tasks, and slices are used in rotation so none is in cache
+/// when its turn comes.
+fn region_stream(data: &[f32], threads: usize, slice_bytes: usize) -> f64 {
+    let pool = Pool::new(threads);
+    let slice = slice_bytes / 4;
+    let slices = data.len() / slice;
+    let task = slice.div_ceil(threads * 4).div_ceil(32) * 32;
+    let region = |i: usize| {
+        let s = &data[i * slice..][..slice];
+        pool.run(slice.div_ceil(task), &|c| {
+            black_box(sum(&s[c * task..((c + 1) * task).min(slice)]));
+        });
+    };
+    for i in 0..slices.min(64) {
+        region(i);
+    }
+    let n = slices.min(2000);
+    let start = Instant::now();
+    for i in 0..n {
+        region(i);
+    }
+    (n * slice_bytes) as f64 / start.elapsed().as_secs_f64() / 1e9
+}
+
 fn main() {
     let data = vec![1.0f32; 1 << 28]; // 1 GiB
+    println!("one cold slice per parallel region, GB/s by thread count and slice size");
+    for mb in [0.8, 1.0, 4.4, 8.8] {
+        let bytes = (mb * 1e6) as usize / 128 * 128;
+        let row: Vec<String> = [4, 6, 8, 10]
+            .iter()
+            .map(|&t| format!("{t}t {:5.1}", region_stream(&data, t, bytes)))
+            .collect();
+        println!("  {mb:4} MB  {}", row.join("  "));
+    }
+    println!("empty parallel region, microseconds by thread count");
+    let row: Vec<String> = [2, 4, 6, 8, 10]
+        .iter()
+        .map(|&t| format!("{t}t {:5.2}", region_cost(t)))
+        .collect();
+    println!("  {}", row.join("  "));
     println!("memory read: GB/s by thread count, median / best of 16 passes over 1 GiB");
     for qos in [false, true] {
         let row: Vec<String> = [1, 2, 4, 6, 8, 10, 12, 14]

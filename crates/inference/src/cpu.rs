@@ -75,7 +75,9 @@ impl Operands for F32Operands<'_> {
 
 /// Int8 weights with a scale per row against int8 activations with a scale per
 /// `Q8_BLOCK` values: the integer dot product, scaled per block by `tile_q8`
-/// and once per weight row here, is the f32 one.
+/// and once per weight row here, is the f32 one. `w` is stored as
+/// `Matrix::q8_index` says: groups of four rows, so a tile of four rows starts
+/// at a multiple of four, and a single row is one of the leftovers at the end.
 struct Q8Operands<'a> {
     w: &'a [i8],
     w_scales: &'a [f32],
@@ -92,6 +94,10 @@ impl Operands for Q8Operands<'_> {
         i: usize,
     ) -> [[f32; T]; R] {
         let (k, blocks) = (self.k, self.k.div_ceil(Q8_BLOCK));
+        debug_assert!(match R {
+            4 => r.is_multiple_of(4),
+            _ => r >= self.w_scales.len() / 4 * 4,
+        });
         let mut out = tile_q8::<R, T>(
             &self.w[r * k..],
             &self.x[i * k..],
@@ -451,7 +457,7 @@ mod tests {
             unreachable!()
         };
         let dequantized_w: Vec<f32> = (0..n_out * n_in)
-            .map(|i| values[i] as f32 * scales[i / n_in])
+            .map(|i| values[q.q8_index(i / n_in, i % n_in)] as f32 * scales[i / n_in])
             .collect();
         let dequantized_w = Matrix::new(n_out, n_in, dequantized_w);
         let bias = data(n_out, 6);

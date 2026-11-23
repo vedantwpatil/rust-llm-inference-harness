@@ -15,6 +15,7 @@ use inference::model::Model;
 use inference::ops::argmax;
 use inference::pool::Pool;
 use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::time::Instant;
 
@@ -50,10 +51,15 @@ fn memory_bandwidth() -> f64 {
 /// Seconds spent in each of `OPS`.
 type Secs = [f64; OPS.len()];
 
+/// Calls, seconds and bytes streamed by the one-token matmuls of each
+/// `(rows, cols)` shape.
+type Shapes = BTreeMap<(usize, usize), (usize, f64, usize)>;
+
 /// Wraps a backend and adds up the time spent in each op: where a token goes.
 struct Timed<B> {
     inner: B,
     secs: Rc<RefCell<Secs>>,
+    shapes: Rc<RefCell<Shapes>>,
 }
 
 const OPS: [&str; 8] = [
@@ -78,7 +84,18 @@ impl<B: Backend> Timed<B> {
 
 impl<B: Backend> Backend for Timed<B> {
     fn matmul(&self, x: &[f32], t: usize, w: &Matrix, bias: Option<&[f32]>) -> Vec<f32> {
-        self.time(0, |b| b.matmul(x, t, w, bias))
+        let start = Instant::now();
+        let out = self.time(0, |b| b.matmul(x, t, w, bias));
+        if t == 1 {
+            let mut shapes = self.shapes.borrow_mut();
+            let e = shapes.entry((w.rows, w.cols)).or_default();
+            *e = (
+                e.0 + 1,
+                e.1 + start.elapsed().as_secs_f64(),
+                e.2 + w.bytes(),
+            );
+        }
+        out
     }
     fn layernorm(&self, x: &[f32], gamma: &[f32], beta: &[f32], eps: f32) -> Vec<f32> {
         self.time(1, |b| b.layernorm(x, gamma, beta, eps))
@@ -106,7 +123,7 @@ impl<B: Backend> Backend for Timed<B> {
 /// Milliseconds per op for one prefill of `ids` and per decoded token, plus
 /// how much of each pass the ops account for (the rest is copies, residual
 /// adds and allocation).
-fn breakdown(model: &dyn Model, secs: &RefCell<Secs>, ids: &[u32]) {
+fn breakdown(model: &dyn Model, secs: &RefCell<Secs>, shapes: &RefCell<Shapes>, ids: &[u32]) {
     let report = |label: &str, total: f64, secs: Secs, per: f64| {
         let parts: Vec<String> = OPS
             .iter()
@@ -131,12 +148,24 @@ fn breakdown(model: &dyn Model, secs: &RefCell<Secs>, ids: &[u32]) {
     report("prefill", total, secs.take(), 1.0);
 
     let steps = 32;
+    shapes.take();
     let start = Instant::now();
     for _ in 0..steps {
         logits = model.forward(&[argmax(&logits)], &mut cache);
     }
     let total = start.elapsed().as_secs_f64();
     report("decode", total, secs.take(), 1.0 / steps as f64);
+
+    println!("decode matmuls by shape (rows x cols): calls and ms per token, MB per call, GB/s");
+    for ((rows, cols), (calls, secs, bytes)) in shapes.take() {
+        println!(
+            "  {rows:6} x {cols:<5} {:3} calls {:6.2} ms {:6.2} MB {:6.1} GB/s",
+            calls / steps,
+            secs / steps as f64 * 1e3,
+            bytes as f64 / calls as f64 / 1e6,
+            bytes as f64 / secs / 1e9,
+        );
+    }
 }
 
 fn median(mut v: Vec<f64>) -> f64 {
@@ -153,9 +182,11 @@ fn main() {
         .map_or("gpt2", |a| a);
 
     let secs = Rc::new(RefCell::new([0.0; 8]));
+    let shapes = Rc::new(RefCell::new(Shapes::new()));
     let backend = Timed {
         inner: CpuBackend::default(),
         secs: secs.clone(),
+        shapes: shapes.clone(),
     };
     let model = common::load_model(name, int8, backend);
     let ids = common::tokenizer(name).encode(PROMPT);
@@ -221,5 +252,5 @@ fn main() {
         roofline,
         100.0 * (1.0 / step_s) / roofline
     );
-    breakdown(&*model, &secs, &ids);
+    breakdown(&*model, &secs, &shapes, &ids);
 }

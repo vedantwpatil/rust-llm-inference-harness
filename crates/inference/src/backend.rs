@@ -1,4 +1,4 @@
-use crate::kernel::{q8_scale, quantize_into};
+use crate::kernel::{Q8_BLOCK, packed_index, q8_scale, quantize_into};
 
 /// A weight matrix stored `[rows = outputs, cols = inputs]`, row-major. Output
 /// `o` of `x @ W^T` is the dot product of `x` with the contiguous run of row
@@ -13,10 +13,10 @@ pub struct Matrix {
 /// How a matrix's values are stored.
 pub enum Weights {
     F32(Vec<f32>),
-    /// Int8: row `r` is `scales[r] * values[r * cols..][..cols]`. Each row has
-    /// its own scale, so one large value only costs the precision of its own
-    /// row. A matmul against these rounds its activations to int8 too, one scale
-    /// per token.
+    /// Int8: row `r` is its values (at `Matrix::q8_index`) times `scales[r]`.
+    /// Each row has its own scale, so one large value only costs the precision
+    /// of its own row. A matmul against these rounds its activations to int8
+    /// too, one scale per `Q8_BLOCK` values.
     Q8 {
         values: Vec<i8>,
         scales: Vec<f32>,
@@ -41,6 +41,19 @@ impl Matrix {
         }
     }
 
+    /// Where `Weights::Q8` keeps element `(row, col)`. Each group of four rows is
+    /// stored block by block (see `packed_index`) so a matmul streams them as
+    /// one run; the rows after the last whole group stay plain.
+    pub fn q8_index(&self, row: usize, col: usize) -> usize {
+        let whole = self.rows / 4 * 4;
+        let (first, group) = if row < whole {
+            (row / 4 * 4, 4)
+        } else {
+            (row, 1)
+        };
+        first * self.cols + packed_index(group, row - first, col, self.cols)
+    }
+
     /// Replaces the values with int8 and one scale per row: the largest
     /// magnitude in a row maps to 127, so no value is clipped and each is off by
     /// at most half a step. Does nothing to a matrix that is already int8.
@@ -50,12 +63,12 @@ impl Matrix {
         };
         let mut values = vec![0i8; data.len()];
         let mut scales = Vec::with_capacity(self.rows);
-        for (row, out) in data
-            .chunks_exact(self.cols)
-            .zip(values.chunks_exact_mut(self.cols))
-        {
+        for (r, row) in data.chunks_exact(self.cols).enumerate() {
             let scale = q8_scale(row);
-            quantize_into(row, scale, out);
+            for (b, block) in row.chunks(Q8_BLOCK).enumerate() {
+                let at = self.q8_index(r, b * Q8_BLOCK);
+                quantize_into(block, scale, &mut values[at..][..block.len()]);
+            }
             scales.push(scale);
         }
         self.weights = Weights::Q8 { values, scales };
@@ -67,7 +80,7 @@ impl Matrix {
         match &self.weights {
             Weights::F32(data) => out.extend_from_slice(&data[start..end]),
             Weights::Q8 { values, scales } => {
-                out.extend(values[start..end].iter().map(|&q| q as f32 * scales[i]));
+                out.extend((0..self.cols).map(|c| values[self.q8_index(i, c)] as f32 * scales[i]))
             }
         }
     }
@@ -153,13 +166,13 @@ mod tests {
             let row = &raw[r * cols..(r + 1) * cols];
             let max = row.iter().fold(0.0f32, |a, v| a.max(v.abs()));
             for (c, &v) in row.iter().enumerate() {
-                let back = values[r * cols + c] as f32 * scales[r];
+                let back = values[m.q8_index(r, c)] as f32 * scales[r];
                 assert!(
                     (back - v).abs() <= scales[r] / 2.0 * 1.0001,
                     "row {r} col {c}"
                 );
             }
-            assert!(values[r * cols..(r + 1) * cols].iter().all(|&q| q != -128));
+            assert!((0..cols).all(|c| values[m.q8_index(r, c)] != -128));
             assert!(max == 0.0 || (scales[r] * 127.0 - max).abs() <= max * 1e-6);
         }
         assert_eq!(m.bytes(), rows * cols + rows * 4);
