@@ -1,6 +1,6 @@
 # Development Notes
 
-Why the tokenizer is built the way it is: reasoning, cost, measured baselines. Structure and data flow: [ARCHITECTURE.md](ARCHITECTURE.md). Plan and open decisions: [ROADMAP.md](ROADMAP.md). Deep dives: [CHARS_VS_BYTES.md](CHARS_VS_BYTES.md), [I32_VS_U32.md](I32_VS_U32.md). Rust mechanics: [RUST_NOTES.md](RUST_NOTES.md).
+Why the code is built the way it is: reasoning, cost, measured baselines. Structure and data flow: [ARCHITECTURE.md](ARCHITECTURE.md). Plan and open decisions: [ROADMAP.md](ROADMAP.md). Deep dives: [CHARS_VS_BYTES.md](CHARS_VS_BYTES.md), [I32_VS_U32.md](I32_VS_U32.md). Rust mechanics: [RUST_NOTES.md](RUST_NOTES.md).
 
 ## Stage 1: byte-level BPE
 
@@ -73,3 +73,47 @@ Every iteration recounts all pairs from scratch.
 
 - 60 KB mixed text: 10.4 ms (5.75 MB/s, 2.1M tokens/s).
 - One 4000-byte chunk: 137.9 ms (0.03 MB/s), about 200x slower per byte, because cost grows with chunk length squared.
+
+## Stage 2: GPT-2 on the CPU
+
+### Verification
+
+The bar is Hugging Face's float32 forward pass on the same ids, compared at every layer boundary, plus greedy `generate` and cached-versus-recomputed decode. Per-element relative error does not work on this model: the residual stream has entries near 3000 next to entries near 0, and float32 summation order moves every entry by a few units in the seventh digit of the largest one. So the check is `max|got - want| <= rel * max|want|`, per tensor. The layer test uses `rel = 1e-4` and the worst observed error is about `1.4e-5`; cached decode against a from-scratch pass uses `1e-5`. Embedding output matches exactly and the error does not compound across blocks: it saturates.
+
+### Why `Matrix` is `[out, in]`
+
+`y = x @ W^T` then reads one weight row and one activation row, both contiguous, per output: a dot product the kernel can stream. Llama's `nn.Linear` is already `[out, in]`, so stage 3 needs no second layout, and int8 scales can attach per output row. GPT-2's `Conv1D` is `[in, out]` and pays one transpose at load.
+
+### Speed
+
+Decode reads every weight once per token and does about two operations per byte, so it is limited by memory bandwidth, not arithmetic. Roofline: `tokens/s = bandwidth / bytes read per token`. For GPT-2 that is 494 MB of f32 weights (the tied token embedding counts once, as the output projection) plus the KV cache, about 10 MB at 100 tokens of context.
+
+**The bandwidth a CPU can reach is not the spec sheet.** On an M3 Max (10 performance plus 4 efficiency cores) the specification says 300 GB/s but a streaming read through the CPU cores saturates near 110 to 127 GB/s, and four threads already get most of it. `bench_gpt2` measures it each run: best of 20 passes over 1 GiB with the model's own `dot`. An average hides cold or contended passes, and bandwidth is a ceiling. Against the spec number the roofline would be about 600 tokens/s and unreachable.
+
+**Why not rayon.** The first version used rayon's `par_chunks_mut`. Decode is about 60 tiny parallel regions per token (four matmuls and one attention per block, plus the output projection), and an empty rayon region measured 16 to 19 µs at 4 threads, about 45 µs at 8 and over 100 µs at 14 (workers asleep). That is a large share of a 5 ms token, and more threads made it worse: the best decode was 160 tokens/s at 4 to 5 threads, 121 at the default. `Pool` replaces it: workers spin about 200 µs after a region, then sleep, so back-to-back regions find them awake. The cost is that idle workers burn CPU for that window.
+
+**Why 8 threads by default.** With 14 threads decode is slower than with 8 to 10: a region ends when its slowest task does, and an efficiency core that claims a task late stalls everyone. `INFERENCE_THREADS` overrides it. The cap of 8 is a measurement on one machine, not a rule.
+
+**The kernel.** `tile<R, T, U>` multiplies `R` weight rows by `T` activation rows with `U` NEON accumulators per output. A fused multiply-add has a latency of a few cycles but the core starts four per cycle, so one accumulator chain leaves the units idle; `U` independent chains fill them. Register budget: `R * T * U` accumulators out of 32 vector registers. Three shapes are used:
+
+| Shape   | Where                         | Why                                                                                                   |
+| ------- | ----------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `4,4,1` | prefill, 4 tokens at a time   | Each loaded weight is reused across 4 tokens and each activation across 4 rows: compute-bound          |
+| `4,1,4` | decode, leftover tokens       | One token, so there is no reuse to tile for; 4 rows with 4 accumulators keep the loads streaming      |
+| `1,1,4` | `dot`, leftover weight rows   | The plain dot product, also used by attention                                                          |
+
+On one core with data in cache `4,4,1` reaches about 113 GFLOP/s (the core's ceiling is roughly 128) and `4,1,4` about 64.
+
+**Where a token goes.** `bench_gpt2` wraps the backend in a timing `Backend` and prints milliseconds per op. That is what found two prefill costs a guess at the matmul would have missed: scalar `gelu` was about a third of prefill, and the serial `[n_out][t]` to `[t][n_out]` transpose in `matmul` about a third of what was left. Both now run on the pool.
+
+**Results**, 103-token prompt, 8 threads, median run. Roofline from the bandwidth measured in the same run.
+
+| Version                                          | Prefill (tokens/s) | Decode (tokens/s) | Decode share of roofline |
+| ------------------------------------------------ | ------------------ | ----------------- | ------------------------ |
+| rayon, 8-accumulator `dot`                       | 705                | 121               | about 50%                |
+| spinning pool, tiled NEON kernels                | about 1200         | about 177         | 75%                      |
+| plus parallel `gelu` and transpose               | about 2600         | about 185 to 193  | about 75%                |
+
+Prefill is about 440 GFLOP/s (17.5 GFLOP for the prompt in about 40 ms). Decode matmul runs at about 107 GB/s of the roughly 120 GB/s probe, so what is left of the gap to the roofline is spread thin: `gelu` and attention take about 0.3 ms each of 5.3 ms, and each parallel region still pays a small wake-up and join cost.
+
+**Not done.** Layer norm and the residual adds are serial (about 3 ms of a 40 ms prefill, negligible in decode). Every `Backend` call allocates a fresh `Vec` for its output.

@@ -11,7 +11,7 @@ For adding agents and subagents to the harness read stage in progress plus [Cros
 | Stage | What                      | Status      |
 | ----- | ------------------------- | ----------- |
 | 1     | Tokenizer: byte-level BPE | Done        |
-| 2     | GPT-2 small on CPU        | In progress |
+| 2     | GPT-2 small on CPU        | Done        |
 | 3     | Llama-style model + int8  | Not started |
 | 4     | Inference harness traits  | Not started |
 | 5     | Coding harness            | Not started |
@@ -198,7 +198,7 @@ Inside forward pass, each of 12 blocks = two residual steps. `(+)` adds block's 
 - **Tensor ops behind `Backend` trait from day one:** matmul, LayerNorm, GELU, softmax, causal attention. CPU implementation = correctness reference (see [Cross-stage constraints](#cross-stage-constraints)).
 - **Forward pass and greedy loop,** verified layer by layer against Hugging Face.
 - **KV cache and prefill/decode split.** Prefill pushes whole prompt through in one matmul-heavy pass. Decode feeds one token, reuses cached keys and values. Per token cache costs 2 x 12 layers x 768 x 4 bytes, about 72 KiB at f32.
-- **Speed:** SIMD matmul, rayon across cores, then benchmark and writeup.
+- **Speed:** NEON matmul kernels across a thread pool, then benchmark and writeup.
 
 **Done when**
 

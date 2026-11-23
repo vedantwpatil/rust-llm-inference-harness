@@ -6,7 +6,7 @@ Cargo workspace, one crate per layer:
 
 - `crates/tokenizer`: the library.
 - `crates/tokenizer-cli`: demo binary (`main.rs`). `take_input` reads the prompt from a positional arg (no `clap`). Prints compression for word, char, byte, trained BPE and GPT-2 BPE.
-- `crates/inference`: stage 2. `safetensors::load` reads GPT-2's weights into `HashMap<String, (Vec<usize>, Vec<f32>)>`: tensor name to (shape, flat row-major values).
+- `crates/inference`: the model side. Safetensors loader, a `Backend` trait with a CPU implementation, the GPT-2 forward pass with a KV cache. Modules in [Inference modules](#inference-modules).
 
 ## Tokenizer modules
 
@@ -62,3 +62,51 @@ Encode and decode: pre-split, bytes to unicode, merge by rank; and back through 
 - A merge's rank is its index in `merges`, the order merges were learned. The encoder replays them in that order, so the order is part of the trained artifact. Hence `Vec`, not `HashMap`: training never looks a merge up, and a map would lose the order. The encoder builds `pair -> rank` and `token -> id` maps from the two vectors at load.
 - `vocab[257 + i] == format!("{a}{b}")` for `merges[i] == (a, b)`.
 - Starting size is 257, so `TOY_VOCAB_SIZE = 280` learns 23 merges.
+
+## Inference modules
+
+`inference` has no tokenizer dependency: it takes ids and returns logits. Demos and benchmarks live in `crates/inference/examples/` and use `tokenizer` as a dev-dependency.
+
+| Module        | Holds                                                                                                                                                         |
+| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `safetensors` | `load`: 8-byte header length, JSON header, raw bytes, into `HashMap<String, (Vec<usize>, Vec<f32>)>` (tensor name to shape and flat row-major values)          |
+| `backend`     | `Matrix { rows, cols, data }`, `AttnShape`, the `Backend` trait: `matmul`, `layernorm`, `gelu`, `softmax`, `attention`                                         |
+| `cpu`         | `CpuBackend { pool }`: the reference `Backend`. Parallel across a `Pool`, matmul through `kernel::tile`                                                       |
+| `kernel`      | `tile<R, T, U>`: `R` weight rows against `T` activation rows, NEON on aarch64, scalar elsewhere. `dot` is the 1 by 1 case                                     |
+| `pool`        | `Pool`: persistent fork-join thread pool. `run(n_tasks, f)`, `for_each_chunk_mut(slice, chunk, f)`                                                            |
+| `kv_cache`    | `KvCache`: per layer, keys and values as flat `[position][kv_dim]` vectors, plus the number of positions held                                                 |
+| `ops`         | `embed`, `add_in_place`, `argmax`                                                                                                                             |
+| `gpt2`        | `Gpt2<B: Backend>`: `from_tensors`, `new_cache`, `forward` (logits for the next token), `forward_trace` (every intermediate), `generate_greedy`               |
+
+### Contracts
+
+- **`Matrix` is `[out, in]`, row-major.** `matmul(x, t, w, bias)` computes `y = x @ w^T + bias` for `t` rows of `x`, so output `o` for one token is a dot product of two contiguous slices. Hugging Face's GPT-2 `Conv1D` weights are `[in, out]` and are transposed once at load.
+- **One attention op for prefill, decode and grouped-query attention.** `AttnShape { t, pos0, n_heads, n_kv_heads, head_dim }`: `t` new queries sit at positions `pos0..pos0 + t`, and `k`, `v` hold all `pos0 + t` positions. Query `i` scores keys `0..=pos0 + i`, which is the causal mask. Query head `h` reads key/value head `h / (n_heads / n_kv_heads)`. Full multi-head attention is `n_kv_heads == n_heads`.
+- **`KvCache` is appended per layer, then advanced once.** A layer's keys and values are `append`ed during the pass, `advance(t)` runs after the last layer, so `len()` is the position of the next token for every layer in between. Position embeddings are offset by `len()`.
+- **`forward_trace` keys match the reference fixture:** `embed`, `block0.ln_1`, `block0.attn`, `block0.ln_2`, `block0.mlp`, `block.N`, `ln_f`, `logits` (every position).
+
+### Forward pass
+
+```text
+ids ─▶ embed (wte[id] + wpe[pos0 + i]) ─▶ x [t, width]
+        │
+        │  per block l:
+        │    h = layernorm(x)
+        │    qkv = matmul(h, c_attn)            [t, 3 * width], split into q | k | v per row
+        │    cache.append(l, k, v)
+        │    a = attention(q, cache keys, cache values)
+        │    x += matmul(a, attn_proj)
+        │    x += matmul(gelu(matmul(layernorm(x), c_fc)), mlp_proj)
+        ▼
+cache.advance(t) ─▶ layernorm ─▶ last row @ wte^T ─▶ logits [vocab]
+```
+
+### Parallelism
+
+`Pool::new(n)` starts `n - 1` workers; the calling thread is the n-th. A region publishes a job (task count, an atomic next-task counter, an atomic done counter) and every thread claims task indices until none are left. Workers spin on an atomic generation counter for a short window after each region, then sleep on a condition variable. A region with one task runs inline. One region runs at a time; a task panic is caught per task and re-raised by `run` after the region ends. Why this instead of rayon: [DEVELOPMENT_NOTES.md](DEVELOPMENT_NOTES.md#stage-2-gpt-2-on-the-cpu).
+
+`CpuBackend::matmul` gives each task 16 whole weight rows and every token's dot product with them, so a weight row is read from memory once however many tokens there are. The result is `[n_out][t]` and a second parallel pass transposes it to `[t][n_out]` and adds the bias. `attention` is one task per (query, head).
+
+### Verification fixtures
+
+`crates/inference/data/gpt2/` is gitignored. `scripts/fetch_model.py` downloads a checkpoint, `scripts/gen_reference.py` runs Hugging Face on a fixed prompt and writes `reference.safetensors` (ids, every traced activation, greedy ids). Tests skip when the files are missing.
