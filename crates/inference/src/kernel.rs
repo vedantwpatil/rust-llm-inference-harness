@@ -97,6 +97,54 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     tile::<1, 1, 4>(a, b, a.len())[0][0]
 }
 
+/// Dot product of int8 weights with f32 activations, not yet multiplied by the
+/// row's scale. Decode is memory-bound, so the point is to read a quarter of the
+/// bytes `dot` reads; the widening to f32 happens in registers, 16 weights per
+/// step, into four accumulators so the fused multiply-adds overlap.
+#[cfg(target_arch = "aarch64")]
+pub fn dot_q8(w: &[i8], x: &[f32]) -> f32 {
+    use std::arch::aarch64::*;
+    assert_eq!(w.len(), x.len());
+    let main = w.len() / 16 * 16;
+    let mut sum;
+    // SAFETY: NEON is part of the aarch64 baseline. Each step loads 16 bytes
+    // from `w` and 4 floats four times from `x`, all starting below `main`
+    // and ending at most at `main <= len`, which the assert ties to both slices.
+    unsafe {
+        let mut acc = [vdupq_n_f32(0.0); 4];
+        let (wp, xp) = (w.as_ptr(), x.as_ptr());
+        for k in (0..main).step_by(16) {
+            let q = vld1q_s8(wp.add(k));
+            let (lo, hi) = (vmovl_s8(vget_low_s8(q)), vmovl_high_s8(q));
+            let widened = [
+                vmovl_s16(vget_low_s16(lo)),
+                vmovl_high_s16(lo),
+                vmovl_s16(vget_low_s16(hi)),
+                vmovl_high_s16(hi),
+            ];
+            for (u, v) in widened.into_iter().enumerate() {
+                acc[u] = vfmaq_f32(acc[u], vcvtq_f32_s32(v), vld1q_f32(xp.add(k + 4 * u)));
+            }
+        }
+        sum = vaddvq_f32(vaddq_f32(
+            vaddq_f32(acc[0], acc[1]),
+            vaddq_f32(acc[2], acc[3]),
+        ));
+    }
+    for k in main..w.len() {
+        sum += w[k] as f32 * x[k];
+    }
+    sum
+}
+
+// shortcut: scalar loop off aarch64, like `tile`; write an AVX2 version when a
+// second target matters.
+#[cfg(not(target_arch = "aarch64"))]
+pub fn dot_q8(w: &[i8], x: &[f32]) -> f32 {
+    assert_eq!(w.len(), x.len());
+    w.iter().zip(x).map(|(&q, v)| q as f32 * v).sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -131,6 +179,17 @@ mod tests {
             check::<4, 4, 1>(k);
             check::<4, 1, 4>(k);
             check::<1, 1, 4>(k);
+        }
+    }
+
+    #[test]
+    fn dot_q8_matches_widening_first() {
+        // lengths: shorter than one step, a tail after whole steps, exact multiples
+        for k in [0, 3, 15, 16, 17, 100, 896] {
+            let w: Vec<i8> = data(k, 3).iter().map(|v| (v * 127.0) as i8).collect();
+            let x = data(k, 4);
+            let want: f64 = w.iter().zip(&x).map(|(&q, &v)| q as f64 * v as f64).sum();
+            assert_close(&[dot_q8(&w, &x)], &[want as f32], 1e-5, 1e-4);
         }
     }
 

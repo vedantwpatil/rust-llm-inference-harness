@@ -1,6 +1,14 @@
-use crate::backend::{AttnShape, Backend, Matrix};
-use crate::kernel::{dot, tile};
+use crate::backend::{AttnShape, Backend, Matrix, Weights};
+use crate::kernel::{dot, dot_q8, tile};
 use crate::pool::Pool;
+use std::cell::RefCell;
+
+thread_local! {
+    // Widened int8 weight rows for the prefill path, one buffer per pool thread
+    // so a task never allocates: a 16-row slab of the widest matrix is ~300 KB,
+    // and a fresh allocation that size would page-fault on every call.
+    static WIDENED: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+}
 
 /// Plain Rust on the CPU: NEON kernels, a spinning thread pool. The reference
 /// every other backend is compared against.
@@ -75,6 +83,31 @@ fn matmul_block(w: &[f32], x: &[f32], k: usize, t: usize, out: &mut [f32]) {
     }
 }
 
+/// Rows `first..` of `w` (as many as `slab` has room for) against every token:
+/// `slab[r * t + i]` is row `first + r` dotted with token `i`.
+fn matmul_rows(w: &Matrix, first: usize, x: &[f32], t: usize, slab: &mut [f32]) {
+    let (n_in, rows) = (w.cols, slab.len() / t);
+    match &w.weights {
+        Weights::F32(data) => matmul_block(&data[first * n_in..][..rows * n_in], x, n_in, t, slab),
+        // One token: read each int8 row once, straight from memory.
+        Weights::Q8 { values, scales } if t == 1 => {
+            for (r, out) in slab.iter_mut().enumerate() {
+                *out = dot_q8(&values[(first + r) * n_in..][..n_in], x) * scales[first + r];
+            }
+        }
+        // Several tokens reuse each row, so widen it to f32 once and let the
+        // f32 tiles do the arithmetic.
+        Weights::Q8 { values, scales } => WIDENED.with_borrow_mut(|buf| {
+            buf.clear();
+            for r in first..first + rows {
+                let row = &values[r * n_in..][..n_in];
+                buf.extend(row.iter().map(|&q| q as f32 * scales[r]));
+            }
+            matmul_block(buf, x, n_in, t, slab);
+        }),
+    }
+}
+
 impl Backend for CpuBackend {
     fn matmul(&self, x: &[f32], t: usize, w: &Matrix, bias: Option<&[f32]>) -> Vec<f32> {
         let (n_out, n_in) = (w.rows, w.cols);
@@ -84,13 +117,30 @@ impl Backend for CpuBackend {
         }
         // Each task owns ROWS whole weight rows and every token's dot product
         // with them, so a weight row is read from memory once however large t
-        // is. That makes the result `[n_out][t]`; transposed below.
+        // is.
         const ROWS: usize = 16;
+
+        // One token: `[n_out][1]` is already `[1][n_out]`, so the tasks write
+        // the result and the bias directly. A second parallel region would do
+        // nothing but cost a fork-join, and a decoded token has ~100 matmuls.
+        if t == 1 {
+            let mut out = vec![0.0; n_out];
+            self.pool.for_each_chunk_mut(&mut out, ROWS, |c, slab| {
+                matmul_rows(w, c * ROWS, x, 1, slab);
+                if let Some(b) = bias {
+                    for (v, b) in slab.iter_mut().zip(&b[c * ROWS..]) {
+                        *v += b;
+                    }
+                }
+            });
+            return out;
+        }
+
+        // Several tokens: the result is `[n_out][t]`; transposed below.
         let mut by_out = vec![0.0; n_out * t];
         self.pool
             .for_each_chunk_mut(&mut by_out, ROWS * t, |c, slab| {
-                let rows = slab.len() / t;
-                matmul_block(&w.data[c * ROWS * n_in..][..rows * n_in], x, n_in, t, slab);
+                matmul_rows(w, c * ROWS, x, t, slab)
             });
 
         // Transpose to `[t][n_out]` and add the bias. A task owns a few whole
@@ -275,7 +325,7 @@ mod tests {
                 for o in 0..n_out {
                     let mut s = bias[o] as f64;
                     for i in 0..n_in {
-                        s += x[tt * n_in + i] as f64 * w.data[o * n_in + i] as f64;
+                        s += x[tt * n_in + i] as f64 * w.f32()[o * n_in + i] as f64;
                     }
                     want[tt * n_out + o] = s as f32;
                 }
@@ -298,6 +348,28 @@ mod tests {
         // [1, 3] and [10, 14] (different mean and spread) land on the same output
         let got = cpu().layernorm(&[1., 3., 10., 14.], &[2., 2.], &[1., 1.], 0.0);
         assert_close(&got, &[-1., 3., -1., 3.], 1e-6, 0.0);
+    }
+
+    #[test]
+    fn int8_matmul_equals_f32_matmul_on_the_dequantized_weights() {
+        let (n_out, n_in) = (37, 100);
+        let mut q = Matrix::new(n_out, n_in, data(n_out * n_in, 4));
+        q.quantize();
+        let Weights::Q8 { values, scales } = &q.weights else {
+            unreachable!()
+        };
+        let widened: Vec<f32> = (0..n_out * n_in)
+            .map(|i| values[i] as f32 * scales[i / n_in])
+            .collect();
+        let widened = Matrix::new(n_out, n_in, widened);
+        let bias = data(n_out, 6);
+        // one token takes the direct kernel; 2 and 9 tokens take the widened path
+        for t in [1, 2, 9] {
+            let x = data(t * n_in, 8);
+            let got = cpu().matmul(&x, t, &q, Some(&bias));
+            let want = cpu().matmul(&x, t, &widened, Some(&bias));
+            assert_close(&got, &want, 1e-5, 1e-4);
+        }
     }
 
     #[test]

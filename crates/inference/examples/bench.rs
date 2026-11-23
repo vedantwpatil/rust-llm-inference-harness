@@ -1,23 +1,22 @@
-//! Prefill and decode speed of GPT-2 on the CPU backend, against the memory
-//! bandwidth roofline.
+//! Prefill and decode speed on the CPU backend, against the memory bandwidth
+//! roofline.
 //!
-//!     cargo run --release -p inference --example bench_gpt2
+//!     cargo run --release -p inference --example bench -- [gpt2 | qwen2.5-coder-0.5b] [--int8]
 //!
-//! `INFERENCE_THREADS=n` sets the model's thread count (default: all cores).
-//! Needs data/gpt2/model.safetensors (see crates/inference/scripts).
+//! `INFERENCE_THREADS=n` sets the model's thread count (default: min(cores, 8)).
+//! Needs the checkpoint in data/<name>/ (see crates/inference/scripts).
+
+mod common;
 
 use inference::backend::{AttnShape, Backend, Matrix};
 use inference::cpu::CpuBackend;
-use inference::gpt2::Gpt2;
 use inference::kernel::dot;
 use inference::model::Model;
 use inference::ops::argmax;
 use inference::pool::Pool;
-use inference::safetensors::load;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::Instant;
-use tokenizer::Tokenizer;
 
 const PROMPT: &str = "The history of computing is a story of abstraction. Early machines were \
 programmed by rewiring them, then by punching cards, then by writing assembly, and finally by \
@@ -51,7 +50,7 @@ fn memory_bandwidth() -> f64 {
 /// Wraps a backend and adds up the time spent in each op: where a token goes.
 struct Timed<B> {
     inner: B,
-    secs: RefCell<[f64; 8]>,
+    secs: Rc<RefCell<[f64; 8]>>,
 }
 
 const OPS: [&str; 8] = [
@@ -104,18 +103,12 @@ impl<B: Backend> Backend for Timed<B> {
 /// Milliseconds per op for one prefill of `ids` and per decoded token, plus
 /// how much of each pass the ops account for (the rest is copies, residual
 /// adds and allocation).
-fn breakdown(tensors: Tensors, ids: &[u32]) {
-    let model = Gpt2::from_tensors(
-        tensors,
-        Timed {
-            inner: CpuBackend::default(),
-            secs: RefCell::new([0.0; 8]),
-        },
-    );
+fn breakdown(model: &dyn Model, secs: &RefCell<[f64; 8]>, ids: &[u32]) {
     let report = |label: &str, total: f64, secs: [f64; 8], per: f64| {
         let parts: Vec<String> = OPS
             .iter()
             .zip(secs)
+            .filter(|&(_, s)| s > 0.0)
             .map(|(name, s)| format!("{name} {:.2}", s * per * 1e3))
             .collect();
         let other = total - secs.iter().sum::<f64>();
@@ -127,16 +120,12 @@ fn breakdown(tensors: Tensors, ids: &[u32]) {
         );
     };
 
+    secs.take();
     let mut cache = model.new_cache();
     let start = Instant::now();
     let mut logits = model.forward(ids, &mut cache);
     let total = start.elapsed().as_secs_f64();
-    report(
-        "prefill",
-        total,
-        std::mem::take(&mut *model.backend().secs.borrow_mut()),
-        1.0,
-    );
+    report("prefill", total, secs.take(), 1.0);
 
     let steps = 32;
     let start = Instant::now();
@@ -144,15 +133,8 @@ fn breakdown(tensors: Tensors, ids: &[u32]) {
         logits = model.forward(&[argmax(&logits)], &mut cache);
     }
     let total = start.elapsed().as_secs_f64();
-    report(
-        "decode",
-        total,
-        std::mem::take(&mut *model.backend().secs.borrow_mut()),
-        1.0 / steps as f64,
-    );
+    report("decode", total, secs.take(), 1.0 / steps as f64);
 }
-
-type Tensors = HashMap<String, (Vec<usize>, Vec<f32>)>;
 
 fn median(mut v: Vec<f64>) -> f64 {
     v.sort_by(f64::total_cmp);
@@ -160,20 +142,21 @@ fn median(mut v: Vec<f64>) -> f64 {
 }
 
 fn main() {
-    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/data/gpt2/");
-    let tensors = load(format!("{dir}model.safetensors").as_ref());
-    // Every matmul weight is read once per decoded token. Token embedding
-    // counts once, as the output projection: the lookup reads a single row.
-    let weight_bytes: usize = tensors
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let int8 = args.iter().any(|a| a == "--int8");
+    let name = args
         .iter()
-        .filter(|(name, _)| {
-            name.ends_with("weight") && !name.contains("ln_") && !name.starts_with("wpe")
-        })
-        .map(|(_, (_, data))| data.len() * 4)
-        .sum();
-    let model = Gpt2::from_tensors(tensors, CpuBackend::default());
-    let tok = Tokenizer::from_gpt2_merges(include_str!("../../tokenizer/data/gpt2/merges.txt"));
-    let ids = tok.encode(PROMPT);
+        .find(|a| !a.starts_with("--"))
+        .map_or("gpt2", |a| a);
+
+    let secs = Rc::new(RefCell::new([0.0; 8]));
+    let backend = Timed {
+        inner: CpuBackend::default(),
+        secs: secs.clone(),
+    };
+    let model = common::load_model(name, int8, backend);
+    let ids = common::tokenizer(name).encode(PROMPT);
+    let weight_bytes = model.weight_bytes();
 
     let bandwidth = memory_bandwidth();
 
@@ -203,8 +186,12 @@ fn main() {
     let kv_bytes = (cache.bytes_per_token() * (ids.len() + NEW_TOKENS / 2)) as f64;
     let roofline = bandwidth / (weight_bytes as f64 + kv_bytes);
     println!(
+        "model                {name}{}",
+        if int8 { " (int8 weights)" } else { "" }
+    );
+    println!(
         "threads              {}",
-        std::env::var("INFERENCE_THREADS").unwrap_or("all".into())
+        std::env::var("INFERENCE_THREADS").unwrap_or("min(cores, 8)".into())
     );
     println!(
         "read per decoded tok {:.0} MB weights + {:.1} MB KV cache",
@@ -231,5 +218,5 @@ fn main() {
         roofline,
         100.0 * (1.0 / step_s) / roofline
     );
-    breakdown(load(format!("{dir}model.safetensors").as_ref()), &ids);
+    breakdown(&*model, &secs, &ids);
 }

@@ -108,7 +108,7 @@ impl<B: Backend> Gpt2<B> {
             head_dim: w / N_HEAD,
         };
         // The new tokens sit at positions pos0.., not 0..: skip that many rows of wpe.
-        let mut x = embed(&self.wte.data, &self.wpe[pos0 * w..], ids, w);
+        let mut x = embed(self.wte.f32(), &self.wpe[pos0 * w..], ids, w);
         note(&mut trace, "embed", &x);
 
         for (l, blk) in self.blocks.iter().enumerate() {
@@ -156,6 +156,16 @@ impl<B: Backend> Model for Gpt2<B> {
         self.backend.matmul(&x[x.len() - w..], 1, &self.wte, None)
     }
 
+    fn weight_bytes(&self) -> usize {
+        let blocks: usize = self
+            .blocks
+            .iter()
+            .flat_map(|b| [&b.c_attn, &b.attn_proj, &b.c_fc, &b.mlp_proj])
+            .map(Matrix::bytes)
+            .sum();
+        blocks + self.wte.bytes()
+    }
+
     fn forward_trace(&self, ids: &[u32]) -> Trace {
         let mut trace = Trace::new();
         let x = self.run(ids, &mut self.new_cache(), Some(&mut trace));
@@ -170,12 +180,16 @@ mod tests {
     use super::*;
     use crate::cpu::CpuBackend;
     use crate::reference::{self, Fixture};
+    use crate::safetensors::load;
 
     const EOS: u32 = 50256;
 
     // Both files are gitignored: tests skip on a fresh clone.
     fn fixture() -> Option<Fixture<Gpt2<CpuBackend>>> {
-        Fixture::load("gpt2", |t| Gpt2::from_tensors(t, CpuBackend::default()))
+        Fixture::load("gpt2", |dir| {
+            let tensors = load(&dir.join("model.safetensors"));
+            Gpt2::from_tensors(tensors, CpuBackend::default())
+        })
     }
 
     #[test]

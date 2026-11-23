@@ -20,19 +20,17 @@ pub fn data_dir(name: &str) -> PathBuf {
 }
 
 impl<M> Fixture<M> {
-    /// Loads `data/<name>/model.safetensors` into a model and
-    /// `data/<name>/reference.safetensors` beside it.
-    pub fn load(name: &str, build: impl FnOnce(Tensors) -> M) -> Option<Self> {
+    /// Builds a model from `data/<name>/` and loads
+    /// `data/<name>/reference.safetensors` beside it. `None` when either the
+    /// weights or the reference file is missing.
+    pub fn load(name: &str, build: impl FnOnce(&Path) -> M) -> Option<Self> {
         let dir = data_dir(name);
-        let (model, reference) = (
-            dir.join("model.safetensors"),
-            dir.join("reference.safetensors"),
-        );
-        if !model.exists() || !reference.exists() {
+        let reference = dir.join("reference.safetensors");
+        if !dir.join("model.safetensors").exists() || !reference.exists() {
             return None;
         }
         Some(Self {
-            model: build(load(&model)),
+            model: build(&dir),
             reference: load(&reference),
         })
     }

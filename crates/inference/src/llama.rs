@@ -3,7 +3,8 @@ use crate::config::LlamaConfig;
 use crate::kv_cache::KvCache;
 use crate::model::{Model, Trace, note};
 use crate::ops::{add_in_place, split_columns};
-use crate::safetensors::{Tensors, take};
+use crate::safetensors::{Tensors, load, take};
+use std::path::Path;
 
 /// One decoder layer. The query, key and value projections are stacked into
 /// one matrix at load, and so are the gate and up projections: one matmul (one
@@ -17,6 +18,21 @@ struct Layer {
     mlp_norm: Vec<f32>,
     gate_up: Matrix,
     down: Matrix,
+}
+
+impl Layer {
+    fn matrices(&self) -> [&Matrix; 4] {
+        [&self.qkv, &self.o_proj, &self.gate_up, &self.down]
+    }
+
+    fn matrices_mut(&mut self) -> [&mut Matrix; 4] {
+        [
+            &mut self.qkv,
+            &mut self.o_proj,
+            &mut self.gate_up,
+            &mut self.down,
+        ]
+    }
 }
 
 /// A Llama-style decoder: token embedding only (position lives in the rotary
@@ -91,6 +107,23 @@ impl<B: Backend> Llama<B> {
             layers,
             norm,
             lm_head,
+        }
+    }
+
+    /// Loads `config.json` and `model.safetensors` from a checkpoint directory.
+    pub fn from_dir(dir: &Path, backend: B) -> Self {
+        let json = std::fs::read_to_string(dir.join("config.json")).unwrap();
+        let tensors = load(&dir.join("model.safetensors"));
+        Self::from_tensors(tensors, LlamaConfig::from_json(&json), backend)
+    }
+
+    /// Stores every weight matrix as int8 with one scale per row, the token
+    /// embedding table (also the output projection when tied) included. Norm
+    /// weights and biases stay f32: they are tiny and every output depends on them.
+    pub fn quantize(&mut self) {
+        let layers = self.layers.iter_mut().flat_map(Layer::matrices_mut);
+        for m in layers.chain([&mut self.embed]).chain(self.lm_head.as_mut()) {
+            m.quantize();
         }
     }
 
@@ -177,6 +210,16 @@ impl<B: Backend> Model for Llama<B> {
             .matmul(&x[x.len() - w..], 1, self.output_projection(), None)
     }
 
+    fn weight_bytes(&self) -> usize {
+        let layers: usize = self
+            .layers
+            .iter()
+            .flat_map(Layer::matrices)
+            .map(Matrix::bytes)
+            .sum();
+        layers + self.output_projection().bytes()
+    }
+
     fn forward_trace(&self, ids: &[u32]) -> Trace {
         let mut trace = Trace::new();
         let x = self.run(ids, &mut self.new_cache(), Some(&mut trace));
@@ -191,27 +234,23 @@ impl<B: Backend> Model for Llama<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assert_close_to_scale;
     use crate::cpu::CpuBackend;
-    use crate::reference::{self, Fixture, data_dir};
+    use crate::ops::argmax;
+    use crate::reference::{self, Fixture};
     use std::sync::OnceLock;
 
-    fn config(name: &str) -> LlamaConfig {
-        LlamaConfig::from_json(
-            &std::fs::read_to_string(data_dir(name).join("config.json")).unwrap(),
-        )
+    const QWEN: &str = "qwen2.5-coder-0.5b";
+
+    fn load_qwen() -> Option<Fixture<Llama<CpuBackend>>> {
+        Fixture::load(QWEN, |dir| Llama::from_dir(dir, CpuBackend::default()))
     }
 
-    // Loading Qwen's weights as f32 takes about 2 GB, so the tests of one
-    // checkpoint share one copy instead of each loading its own.
+    // Loading Qwen's weights as f32 takes about 2 GB, so the tests that only
+    // read the model share one copy instead of each loading its own.
     fn qwen() -> Option<&'static Fixture<Llama<CpuBackend>>> {
-        static QWEN: OnceLock<Option<Fixture<Llama<CpuBackend>>>> = OnceLock::new();
-        QWEN.get_or_init(|| {
-            let name = "qwen2.5-coder-0.5b";
-            Fixture::load(name, |t| {
-                Llama::from_tensors(t, config(name), CpuBackend::default())
-            })
-        })
-        .as_ref()
+        static MODEL: OnceLock<Option<Fixture<Llama<CpuBackend>>>> = OnceLock::new();
+        MODEL.get_or_init(load_qwen).as_ref()
     }
 
     #[test]
@@ -235,10 +274,32 @@ mod tests {
         }
     }
 
+    // Quantizing is lossy, so the bar is far looser than 1e-4: the next-token
+    // logits of the chat prompt must stay close to Hugging Face's float32 ones
+    // and pick the same token.
+    #[test]
+    fn qwen_int8_logits_stay_close_to_hugging_face() {
+        let Some(mut f) = load_qwen() else { return };
+        f.model.quantize();
+        let ids = f.ids("ids");
+        let got = f.model.forward(&ids, &mut f.model.new_cache());
+        let all = &f.reference["logits"].1;
+        let want = &all[all.len() - got.len()..];
+        assert_eq!(argmax(&got), argmax(want));
+        assert_close_to_scale(&got, want, 5e-2);
+    }
+
     const TINY: &str = "tiny-llama3";
 
-    fn tiny(cfg: LlamaConfig) -> Option<Fixture<Llama<CpuBackend>>> {
-        Fixture::load(TINY, |t| Llama::from_tensors(t, cfg, CpuBackend::new(2)))
+    fn tiny(rope_scaling: bool) -> Option<Fixture<Llama<CpuBackend>>> {
+        Fixture::load(TINY, |dir| {
+            let mut model = Llama::from_dir(dir, CpuBackend::new(2));
+            if !rope_scaling {
+                model.cfg.rope_scaling = None;
+                model.inv_freq = model.cfg.inv_freq();
+            }
+            model
+        })
     }
 
     // A random Llama 3 style model: untied output projection, no biases, and
@@ -246,21 +307,17 @@ mod tests {
     // the first, with a prompt that runs past the original context.
     #[test]
     fn tiny_llama3_matches_hugging_face() {
-        if let Some(f) = tiny(config(TINY)) {
+        if let Some(f) = tiny(true) {
             reference::check_layers(&f, 2, 1e-4);
             reference::check_greedy(&f, &f.model.config().eos);
             reference::check_cached_decode(&f, 1e-4);
         }
     }
 
-    // Without the scaling the same test must fail, or it proves nothing.
+    // Without the scaling the same check must fail, or it proves nothing.
     #[test]
     fn rope_scaling_is_what_the_tiny_test_checks() {
-        let cfg = LlamaConfig {
-            rope_scaling: None,
-            ..config(TINY)
-        };
-        if let Some(f) = tiny(cfg) {
+        if let Some(f) = tiny(false) {
             let check = std::panic::AssertUnwindSafe(|| reference::check_layers(&f, 2, 1e-4));
             assert!(std::panic::catch_unwind(check).is_err());
         }

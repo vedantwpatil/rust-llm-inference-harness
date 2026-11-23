@@ -1,23 +1,79 @@
 /// A weight matrix stored `[rows = outputs, cols = inputs]`, row-major. Output
-/// `o` of `x @ W^T` is the dot product of `x` with the contiguous run
-/// `data[o * cols..(o + 1) * cols]`, which is what a matrix-vector kernel
-/// wants to stream. Hugging Face's GPT-2 `Conv1D` weights are `[in, out]` and
-/// are transposed once at load.
+/// `o` of `x @ W^T` is the dot product of `x` with the contiguous run of row
+/// `o`, which is what a matrix-vector kernel wants to stream. Hugging Face's
+/// GPT-2 `Conv1D` weights are `[in, out]` and are transposed once at load.
 pub struct Matrix {
     pub rows: usize,
     pub cols: usize,
-    pub data: Vec<f32>,
+    pub weights: Weights,
+}
+
+/// How a matrix's values are stored.
+pub enum Weights {
+    F32(Vec<f32>),
+    /// Weight-only int8: row `r` is `scales[r] * values[r * cols..][..cols]`.
+    /// Each row has its own scale, so one large value only costs the precision
+    /// of its own row. Activations stay f32.
+    Q8 {
+        values: Vec<i8>,
+        scales: Vec<f32>,
+    },
 }
 
 impl Matrix {
     pub fn new(rows: usize, cols: usize, data: Vec<f32>) -> Self {
         assert_eq!(data.len(), rows * cols);
-        Self { rows, cols, data }
+        Self {
+            rows,
+            cols,
+            weights: Weights::F32(data),
+        }
     }
 
-    /// Appends row `i` to `out`: an embedding lookup.
+    /// The values of an unquantized matrix.
+    pub fn f32(&self) -> &[f32] {
+        match &self.weights {
+            Weights::F32(data) => data,
+            Weights::Q8 { .. } => panic!("matrix is quantized"),
+        }
+    }
+
+    /// Replaces the values with int8 and one scale per row: the largest
+    /// magnitude in a row maps to 127, so no value is clipped and each is off by
+    /// at most half a step. Does nothing to a matrix that is already int8.
+    pub fn quantize(&mut self) {
+        let Weights::F32(data) = &self.weights else {
+            return;
+        };
+        let mut values = Vec::with_capacity(data.len());
+        let mut scales = Vec::with_capacity(self.rows);
+        for row in data.chunks_exact(self.cols) {
+            let max = row.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+            // An all-zero row has nothing to scale; 1 keeps the division finite.
+            let scale = if max == 0.0 { 1.0 } else { max / 127.0 };
+            values.extend(row.iter().map(|v| (v / scale).round() as i8));
+            scales.push(scale);
+        }
+        self.weights = Weights::Q8 { values, scales };
+    }
+
+    /// Appends row `i` to `out` as f32: an embedding lookup.
     pub fn push_row(&self, i: usize, out: &mut Vec<f32>) {
-        out.extend_from_slice(&self.data[i * self.cols..(i + 1) * self.cols]);
+        let (start, end) = (i * self.cols, (i + 1) * self.cols);
+        match &self.weights {
+            Weights::F32(data) => out.extend_from_slice(&data[start..end]),
+            Weights::Q8 { values, scales } => {
+                out.extend(values[start..end].iter().map(|&q| q as f32 * scales[i]));
+            }
+        }
+    }
+
+    /// Bytes of memory the values take: what a matmul streams from memory.
+    pub fn bytes(&self) -> usize {
+        match &self.weights {
+            Weights::F32(data) => data.len() * 4,
+            Weights::Q8 { values, scales } => values.len() + scales.len() * 4,
+        }
     }
 }
 
@@ -71,4 +127,47 @@ pub trait Backend {
     /// `[pos0 + t, n_kv_heads * head_dim]`. Query `i` attends to key positions
     /// `0..=pos0 + i`. Result is `[t, n_heads * head_dim]`, heads concatenated.
     fn attention(&self, q: &[f32], k: &[f32], v: &[f32], shape: AttnShape) -> Vec<f32>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_data::data;
+
+    #[test]
+    fn quantize_is_within_half_a_step_and_exact_at_the_row_max() {
+        let (rows, cols) = (5, 70);
+        let mut raw = data(rows * cols, 7);
+        raw[cols..2 * cols].fill(0.0); // an all-zero row
+        let mut m = Matrix::new(rows, cols, raw.clone());
+        let before = m.bytes();
+        m.quantize();
+        let Weights::Q8 { values, scales } = &m.weights else {
+            panic!("not quantized")
+        };
+        for r in 0..rows {
+            let row = &raw[r * cols..(r + 1) * cols];
+            let max = row.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+            for (c, &v) in row.iter().enumerate() {
+                let back = values[r * cols + c] as f32 * scales[r];
+                assert!(
+                    (back - v).abs() <= scales[r] / 2.0 * 1.0001,
+                    "row {r} col {c}"
+                );
+            }
+            assert!(values[r * cols..(r + 1) * cols].iter().all(|&q| q != -128));
+            assert!(max == 0.0 || (scales[r] * 127.0 - max).abs() <= max * 1e-6);
+        }
+        assert_eq!(m.bytes(), rows * cols + rows * 4);
+        assert!(m.bytes() * 3 < before);
+        // an embedding lookup gives the dequantized row
+        let mut out = Vec::new();
+        m.push_row(3, &mut out);
+        let want = &raw[3 * cols..4 * cols];
+        assert!(
+            out.iter()
+                .zip(want)
+                .all(|(a, b)| (a - b).abs() <= scales[3] / 2.0 * 1.0001)
+        );
+    }
 }
