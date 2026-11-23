@@ -248,28 +248,62 @@ impl CpuBackend {
             return out;
         }
 
-        // Several tokens: the result is `[n_out][t]`; transposed below.
-        let mut by_out = vec![0.0; n_out * t];
-        self.pool
-            .for_each_chunk_mut(&mut by_out, PREFILL_ROWS * t, |c, slab| {
-                matmul_block(ops, c * PREFILL_ROWS, t, slab)
-            });
-
-        // Transpose to `[t][n_out]` and add the bias. A task owns a few whole
-        // token rows of `out`, so the writes stay disjoint.
-        const TOKENS: usize = 4;
+        // Several tokens. A task's rows give a 16-wide strip of every token's
+        // output row, so it computes them as `[rows][t]` in a small block and
+        // copies each token's strip to its place in the result.
         let mut out = vec![0.0; t * n_out];
-        self.pool
-            .for_each_chunk_mut(&mut out, TOKENS * n_out, |c, rows| {
-                let first = c * TOKENS;
-                for o in 0..n_out {
-                    let b = bias.map_or(0.0, |b| b[o]);
-                    for (j, row) in rows.chunks_exact_mut(n_out).enumerate() {
-                        row[o] = by_out[o * t + first + j] + b;
-                    }
+        let strips = Strips::new(&mut out);
+        self.pool.run(n_out.div_ceil(PREFILL_ROWS), &|c| {
+            let first = c * PREFILL_ROWS;
+            let rows = PREFILL_ROWS.min(n_out - first);
+            let mut block = vec![0.0; rows * t];
+            matmul_block(ops, first, t, &mut block);
+            let mut strip = [0.0; PREFILL_ROWS];
+            for i in 0..t {
+                for (r, v) in strip[..rows].iter_mut().enumerate() {
+                    *v = block[r * t + i] + bias.map_or(0.0, |b| b[first + r]);
                 }
-            });
+                // SAFETY: this task writes only columns `first..first + rows` of
+                // each row of `out`, and other tasks have other columns.
+                unsafe { strips.write(i * n_out + first, &strip[..rows]) };
+            }
+        });
         out
+    }
+}
+
+/// A buffer that tasks write disjoint pieces of at once, where the pieces are
+/// not contiguous (a column strip of each row of a matrix), so `&mut` slices
+/// cannot be handed out the way `Pool::for_each_chunk_mut` does.
+struct Strips<'a> {
+    ptr: *mut f32,
+    len: usize,
+    buffer: std::marker::PhantomData<&'a mut [f32]>,
+}
+
+// SAFETY: the pointer is only used by `write`, whose callers promise that no two
+// threads write the same element.
+unsafe impl Sync for Strips<'_> {}
+
+impl<'a> Strips<'a> {
+    fn new(buffer: &'a mut [f32]) -> Self {
+        Self {
+            ptr: buffer.as_mut_ptr(),
+            len: buffer.len(),
+            buffer: std::marker::PhantomData,
+        }
+    }
+
+    /// Copies `values` to the buffer starting at `at`.
+    ///
+    /// # Safety
+    /// No other thread may write or read any of those elements while this runs.
+    unsafe fn write(&self, at: usize, values: &[f32]) {
+        assert!(at + values.len() <= self.len);
+        // SAFETY: in bounds by the assert, and `values` cannot overlap the
+        // buffer, which `Strips` borrows exclusively; exclusivity of the
+        // destination is the caller's promise.
+        unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), self.ptr.add(at), values.len()) };
     }
 }
 
