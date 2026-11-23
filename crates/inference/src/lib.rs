@@ -1,8 +1,10 @@
 pub mod backend;
 pub mod cpu;
 pub mod gpt2;
+pub mod kernel;
 pub mod kv_cache;
 pub mod ops;
+pub mod pool;
 pub mod safetensors;
 
 /// The largest `|got - want|` is at most `rel * max|want|`: error measured
@@ -33,5 +35,19 @@ pub(crate) fn assert_close(got: &[f32], want: &[f32], atol: f32, rtol: f32) {
             (g - w).abs() <= atol + rtol * w.abs(),
             "index {i}: got {g}, want {w}"
         );
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_data {
+    /// Small deterministic pseudo-random values in -0.5..0.5, no rand dependency.
+    pub fn data(n: usize, seed: u32) -> Vec<f32> {
+        let mut s = seed;
+        (0..n)
+            .map(|_| {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                (s >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+            })
+            .collect()
     }
 }

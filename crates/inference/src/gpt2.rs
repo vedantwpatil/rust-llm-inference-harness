@@ -100,6 +100,10 @@ impl<B: Backend> Gpt2<B> {
         }
     }
 
+    pub fn backend(&self) -> &B {
+        &self.backend
+    }
+
     pub fn new_cache(&self) -> KvCache {
         KvCache::new(self.blocks.len(), self.wte.cols)
     }
@@ -219,7 +223,7 @@ mod tests {
             return None;
         }
         Some((
-            Gpt2::from_tensors(load(&model), CpuBackend),
+            Gpt2::from_tensors(load(&model), CpuBackend::default()),
             load(&reference),
         ))
     }
