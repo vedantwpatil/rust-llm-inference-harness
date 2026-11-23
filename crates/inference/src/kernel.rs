@@ -99,6 +99,31 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     tile::<1, 1, 4>(a, b, a.len())[0][0]
 }
 
+/// `e^x`, written so that a loop over a slice vectorizes: no branch and no call,
+/// where libm's `expf` is one call per value (about 2.5 ns each, which made
+/// swiglu and softmax a tenth of a prefill). The relative error is below 3e-7
+/// for `x` in -87..=88; outside it `x` is clamped, which gives 1.6e-38 or 1.6e38
+/// where `exp` would give 0 or infinity.
+#[inline]
+pub fn exp(x: f32) -> f32 {
+    const LOG2_E: f32 = std::f32::consts::LOG2_E;
+    // ln 2 as a float with its low bits zero (so `n * LN2_HI` is exact for the
+    // small integers `n` here) plus the remainder: the reduced argument stays
+    // accurate where one constant would round it.
+    const LN2_HI: f32 = 0.693_145_75;
+    const LN2_LO: f32 = 1.428_606_8e-6;
+    let x = x.clamp(-87.0, 88.0);
+    // e^x = 2^n * e^r with |r| <= ln 2 / 2, where a degree-6 series is enough.
+    let n = (x * LOG2_E).round();
+    let r = (-n).mul_add(LN2_LO, (-n).mul_add(LN2_HI, x));
+    let mut p = 1.0f32 / 720.0;
+    for c in [1.0 / 120.0, 1.0 / 24.0, 1.0 / 6.0, 0.5, 1.0, 1.0] {
+        p = p.mul_add(r, c);
+    }
+    // 2^n is an exponent field: n + 127 in bits 23..31.
+    p * f32::from_bits(((n as i32 + 127) as u32) << 23)
+}
+
 /// Activation values that share one int8 scale. A scale per whole token lets
 /// one outlier channel crush the precision of every other value in it (top-1
 /// agreement with f32 drops 2.5 points on Qwen); a scale per block confines the
@@ -326,6 +351,21 @@ mod tests {
             assert!((q as f32 * scale - v).abs() <= 0.5 * scale * (1.0 + 1e-5));
         }
         assert_eq!(q8_scale(&[0.0; 8]), 1.0);
+    }
+
+    #[test]
+    fn exp_matches_std_over_its_range() {
+        let mut worst = 0.0f64;
+        for i in -8700..=8800 {
+            let x = i as f32 / 100.0;
+            let want = (x as f64).exp();
+            worst = worst.max((exp(x) as f64 - want).abs() / want);
+        }
+        assert!(worst < 3e-7, "relative error {worst}");
+        assert_eq!(exp(0.0), 1.0);
+        // clamped, never infinite or NaN
+        assert!(exp(1e9).is_finite() && exp(-1e9) > 0.0 && exp(-1e9) < 1e-37);
+        assert!(exp(f32::NAN).is_nan());
     }
 
     #[test]

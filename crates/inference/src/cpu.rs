@@ -1,5 +1,5 @@
 use crate::backend::{AttnShape, Backend, Matrix, Weights};
-use crate::kernel::{Q8_BLOCK, dot, q8_scale, quantize_into, tile, tile_q8};
+use crate::kernel::{Q8_BLOCK, dot, exp, q8_scale, quantize_into, tile, tile_q8};
 use crate::pool::Pool;
 
 /// Plain Rust on the CPU: NEON kernels, a spinning thread pool. The reference
@@ -13,6 +13,50 @@ impl CpuBackend {
         Self {
             pool: Pool::new(threads),
         }
+    }
+}
+
+impl CpuBackend {
+    /// Elements per task when `len` of them are shared out, about four tasks per
+    /// thread, but never fewer than `min`. A task has to outweigh the ~120 ns it
+    /// costs to claim it (every thread's claim queues on one counter), so a task
+    /// of a few hundred elements makes a region slower than doing it inline;
+    /// `len <= min` is one task, which `Pool` runs on the calling thread.
+    fn chunk(&self, len: usize, min: usize) -> usize {
+        len.div_ceil(self.pool.threads() * 4).max(min)
+    }
+
+    /// `x` (`[t][k]`) rounded to int8, with one scale per `Q8_BLOCK` values of
+    /// each row.
+    fn quantize_rows(&self, x: &[f32], t: usize, k: usize) -> (Vec<i8>, Vec<f32>) {
+        let blocks = k.div_ceil(Q8_BLOCK);
+        // Whole rows per task.
+        let rows = self.chunk(x.len(), 8192).div_ceil(k);
+        let mut scales = vec![0.0; t * blocks];
+        self.pool
+            .for_each_chunk_mut(&mut scales, rows * blocks, |c, out| {
+                let pairs = x[c * rows * k..]
+                    .chunks_exact(k)
+                    .zip(out.chunks_mut(blocks));
+                for (row, out) in pairs {
+                    for (s, vals) in out.iter_mut().zip(row.chunks(Q8_BLOCK)) {
+                        *s = q8_scale(vals);
+                    }
+                }
+            });
+        let mut xq = vec![0i8; x.len()];
+        self.pool.for_each_chunk_mut(&mut xq, rows * k, |c, out| {
+            for (j, out) in out.chunks_exact_mut(k).enumerate() {
+                let i = c * rows + j;
+                let pairs = out
+                    .chunks_mut(Q8_BLOCK)
+                    .zip(x[i * k..][..k].chunks(Q8_BLOCK));
+                for (b, (out, vals)) in pairs.enumerate() {
+                    quantize_into(vals, scales[i * blocks + b], out);
+                }
+            }
+        });
+        (xq, scales)
     }
 }
 
@@ -34,11 +78,10 @@ impl Default for CpuBackend {
 pub(crate) fn softmax_in_place(x: &mut [f32]) {
     // Subtracting the max keeps exp() from overflowing; the result is the same.
     let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut sum = 0.0;
     for v in x.iter_mut() {
-        *v = (*v - max).exp();
-        sum += *v;
+        *v = exp(*v - max);
     }
+    let sum: f32 = x.iter().sum();
     for v in x.iter_mut() {
         *v /= sum;
     }
@@ -226,22 +269,7 @@ impl Backend for CpuBackend {
             ),
             Weights::Q8 { values, scales } => {
                 // Quantize each token's activations once for the whole product.
-                // The scales come first (cheap, serial); the rounding, which is
-                // most of the work, runs in parallel.
-                let blocks = k.div_ceil(Q8_BLOCK);
-                let x_scales: Vec<f32> = x
-                    .chunks_exact(k)
-                    .flat_map(|row| row.chunks(Q8_BLOCK).map(q8_scale))
-                    .collect();
-                let mut xq = vec![0i8; x.len()];
-                self.pool.for_each_chunk_mut(&mut xq, k, |i, out| {
-                    let row = out
-                        .chunks_mut(Q8_BLOCK)
-                        .zip(x[i * k..][..k].chunks(Q8_BLOCK));
-                    for (b, (out, vals)) in row.enumerate() {
-                        quantize_into(vals, x_scales[i * blocks + b], out);
-                    }
-                });
+                let (xq, x_scales) = self.quantize_rows(x, t, k);
                 let ops = Q8Operands {
                     w: values,
                     w_scales: scales,
@@ -289,18 +317,25 @@ impl Backend for CpuBackend {
         let mut out = vec![0.0; gate_up.len() / 2];
         // Chunks over the flat output, not one per row: a decoded token is a
         // single row and would otherwise run on one thread.
-        const CHUNK: usize = 512;
-        self.pool.for_each_chunk_mut(&mut out, CHUNK, |c, chunk| {
-            let (mut row, mut j) = ((c * CHUNK) / width, (c * CHUNK) % width);
-            for v in chunk {
-                let g = gate_up[row * 2 * width + j];
-                *v = g / (1.0 + (-g).exp()) * gate_up[row * 2 * width + width + j];
-                j += 1;
-                if j == width {
-                    (row, j) = (row + 1, 0);
+        let chunk_len = self.chunk(out.len(), 8192);
+        self.pool
+            .for_each_chunk_mut(&mut out, chunk_len, |c, chunk| {
+                // Cut the chunk where a row ends: each piece is a plain zip of
+                // slices, which the compiler vectorizes.
+                let (mut at, mut rest) = (c * chunk_len, chunk);
+                while !rest.is_empty() {
+                    let (row, j) = (at / width, at % width);
+                    let (run, tail) = rest.split_at_mut(rest.len().min(width - j));
+                    let first = row * 2 * width + j;
+                    let gate = &gate_up[first..][..run.len()];
+                    let up = &gate_up[first + width..][..run.len()];
+                    for ((v, &g), &u) in run.iter_mut().zip(gate).zip(up) {
+                        *v = g / (1.0 + exp(-g)) * u;
+                    }
+                    at += run.len();
+                    rest = tail;
                 }
-            }
-        });
+            });
         out
     }
 
@@ -325,15 +360,16 @@ impl Backend for CpuBackend {
 
     fn gelu(&self, x: &mut [f32]) {
         const SQRT_2_OVER_PI: f32 = 0.797_884_6;
-        // A scalar tanh per element: serial it was a third of prefill time. A
-        // chunk this size is also more than one decoded token's 3072, so decode
-        // stays a single inline task.
-        self.pool.for_each_chunk_mut(x, 4096, |_, chunk| {
-            for v in chunk {
-                let inner = SQRT_2_OVER_PI * (*v + 0.044715 * *v * *v * *v);
-                *v = 0.5 * *v * (1.0 + inner.tanh());
-            }
-        });
+        // Serial, this was a third of prefill time. Decode's 3072 values are one
+        // inline task.
+        self.pool
+            .for_each_chunk_mut(x, self.chunk(x.len(), 4096), |_, chunk| {
+                for v in chunk {
+                    let inner = SQRT_2_OVER_PI * (*v + 0.044715 * *v * *v * *v);
+                    // tanh(a) = 1 - 2 / (e^(2a) + 1)
+                    *v = 0.5 * *v * (2.0 - 2.0 / (exp(2.0 * inner) + 1.0));
+                }
+            });
     }
 
     fn softmax(&self, x: &mut [f32]) {
