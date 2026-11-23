@@ -10,6 +10,7 @@ use inference::backend::{AttnShape, Backend, Matrix};
 use inference::cpu::CpuBackend;
 use inference::gpt2::Gpt2;
 use inference::kernel::dot;
+use inference::model::Model;
 use inference::ops::argmax;
 use inference::pool::Pool;
 use inference::safetensors::load;

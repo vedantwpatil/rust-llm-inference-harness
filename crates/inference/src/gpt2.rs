@@ -1,15 +1,13 @@
 use crate::backend::{AttnShape, Backend, Matrix};
 use crate::kv_cache::KvCache;
-use crate::ops::{add_in_place, argmax, embed};
-use std::collections::HashMap;
+use crate::model::{Model, Trace, note};
+use crate::ops::{add_in_place, embed, split_columns};
+use crate::safetensors::{Tensors, take};
 
 // GPT-2 small. The checkpoint stores no hyperparameters; the layer count,
 // width, context and vocabulary come from tensor shapes, these two do not.
 const N_HEAD: usize = 12;
 const EPS: f32 = 1e-5;
-
-/// Named intermediate activations, filled when a forward pass is traced.
-pub type Trace = HashMap<String, Vec<f32>>;
 
 struct Block {
     ln_1: (Vec<f32>, Vec<f32>),
@@ -31,14 +29,6 @@ pub struct Gpt2<B: Backend> {
     wpe: Vec<f32>,
     blocks: Vec<Block>,
     ln_f: (Vec<f32>, Vec<f32>),
-}
-
-type Tensors = HashMap<String, (Vec<usize>, Vec<f32>)>;
-
-fn take(tensors: &mut Tensors, name: &str) -> (Vec<usize>, Vec<f32>) {
-    tensors
-        .remove(name)
-        .unwrap_or_else(|| panic!("checkpoint has no tensor {name}"))
 }
 
 /// Hugging Face `Conv1D` weights are `[in, out]`; `Matrix` wants `[out, in]`.
@@ -104,10 +94,6 @@ impl<B: Backend> Gpt2<B> {
         &self.backend
     }
 
-    pub fn new_cache(&self) -> KvCache {
-        KvCache::new(self.blocks.len(), self.wte.cols)
-    }
-
     /// Runs `ids` as positions `cache.len()..` and returns the final-layer-norm
     /// output `[ids.len(), width]`. Appends the new keys and values to `cache`.
     fn run(&self, ids: &[u32], cache: &mut KvCache, mut trace: Option<&mut Trace>) -> Vec<f32> {
@@ -121,57 +107,40 @@ impl<B: Backend> Gpt2<B> {
             n_kv_heads: N_HEAD,
             head_dim: w / N_HEAD,
         };
-        let mut note = |name: String, x: &[f32]| {
-            if let Some(tr) = trace.as_deref_mut() {
-                tr.insert(name, x.to_vec());
-            }
-        };
-
         // The new tokens sit at positions pos0.., not 0..: skip that many rows of wpe.
         let mut x = embed(&self.wte.data, &self.wpe[pos0 * w..], ids, w);
-        note("embed".into(), &x);
+        note(&mut trace, "embed", &x);
 
         for (l, blk) in self.blocks.iter().enumerate() {
             let h = b.layernorm(&x, &blk.ln_1.0, &blk.ln_1.1, EPS);
-            note(format!("block{l}.ln_1"), &h);
+            note(&mut trace, format!("block{l}.ln_1"), &h);
 
             // c_attn fuses query, key, value: each row is [q | k | v], w wide each.
             let qkv = b.matmul(&h, t, &blk.c_attn, Some(&blk.c_attn_bias));
-            let (mut q, mut k, mut v) = (Vec::new(), Vec::new(), Vec::new());
-            for row in qkv.chunks_exact(3 * w) {
-                q.extend_from_slice(&row[..w]);
-                k.extend_from_slice(&row[w..2 * w]);
-                v.extend_from_slice(&row[2 * w..]);
-            }
-            cache.append(l, &k, &v);
+            let [q, k, v] = &split_columns(&qkv, &[w; 3])[..] else {
+                unreachable!()
+            };
+            cache.append(l, k, v);
             let (all_k, all_v) = &cache.layers[l];
-            let a = b.attention(&q, all_k, all_v, shape);
+            let a = b.attention(q, all_k, all_v, shape);
             let a = b.matmul(&a, t, &blk.attn_proj, Some(&blk.attn_proj_bias));
-            note(format!("block{l}.attn"), &a);
+            note(&mut trace, format!("block{l}.attn"), &a);
             add_in_place(&mut x, &a);
 
             let h = b.layernorm(&x, &blk.ln_2.0, &blk.ln_2.1, EPS);
-            note(format!("block{l}.ln_2"), &h);
+            note(&mut trace, format!("block{l}.ln_2"), &h);
             let mut m = b.matmul(&h, t, &blk.c_fc, Some(&blk.c_fc_bias));
             b.gelu(&mut m);
             let m = b.matmul(&m, t, &blk.mlp_proj, Some(&blk.mlp_proj_bias));
-            note(format!("block{l}.mlp"), &m);
+            note(&mut trace, format!("block{l}.mlp"), &m);
             add_in_place(&mut x, &m);
-            note(format!("block.{l}"), &x);
+            note(&mut trace, format!("block.{l}"), &x);
         }
         cache.advance(t);
 
         let x = b.layernorm(&x, &self.ln_f.0, &self.ln_f.1, EPS);
-        note("ln_f".into(), &x);
+        note(&mut trace, "ln_f", &x);
         x
-    }
-
-    /// Logits `[vocab]` for the token after the last of `ids`.
-    pub fn forward(&self, ids: &[u32], cache: &mut KvCache) -> Vec<f32> {
-        let x = self.run(ids, cache, None);
-        let w = self.wte.cols;
-        // Output projection is tied to the embedding table: logits = x @ wte^T.
-        self.backend.matmul(&x[x.len() - w..], 1, &self.wte, None)
     }
 
     /// Like `forward` from an empty cache, but returns every intermediate
@@ -183,22 +152,18 @@ impl<B: Backend> Gpt2<B> {
         trace.insert("logits".into(), logits);
         trace
     }
+}
 
-    /// Greedy decoding: the prompt followed by up to `max_new` argmax tokens,
-    /// stopping after `eos` if it is produced.
-    pub fn generate_greedy(&self, prompt: &[u32], max_new: usize, eos: Option<u32>) -> Vec<u32> {
-        let mut cache = self.new_cache();
-        let mut out = prompt.to_vec();
-        let mut logits = self.forward(prompt, &mut cache);
-        for step in 0..max_new {
-            let next = argmax(&logits);
-            out.push(next);
-            if Some(next) == eos || step + 1 == max_new {
-                break;
-            }
-            logits = self.forward(&[next], &mut cache);
-        }
-        out
+impl<B: Backend> Model for Gpt2<B> {
+    fn new_cache(&self) -> KvCache {
+        KvCache::new(self.blocks.len(), self.wte.cols)
+    }
+
+    fn forward(&self, ids: &[u32], cache: &mut KvCache) -> Vec<f32> {
+        let x = self.run(ids, cache, None);
+        let w = self.wte.cols;
+        // Output projection is tied to the embedding table: logits = x @ wte^T.
+        self.backend.matmul(&x[x.len() - w..], 1, &self.wte, None)
     }
 }
 
@@ -262,7 +227,7 @@ mod tests {
         };
         let prompt = ids_of(&reference, "ids");
         let want = ids_of(&reference, "greedy_ids");
-        let got = model.generate_greedy(&prompt, want.len() - prompt.len(), Some(EOS));
+        let got = model.generate_greedy(&prompt, want.len() - prompt.len(), &[EOS]);
         assert_eq!(got, want);
     }
 

@@ -3,6 +3,7 @@ pub mod cpu;
 pub mod gpt2;
 pub mod kernel;
 pub mod kv_cache;
+pub mod model;
 pub mod ops;
 pub mod pool;
 pub mod safetensors;

@@ -26,6 +26,26 @@ pub fn add_in_place(x: &mut [f32], y: &[f32]) {
     }
 }
 
+/// Splits each row of `x`, `widths.iter().sum()` values wide, into one buffer
+/// per width: a fused `[query | key | value]` projection back into its parts.
+pub fn split_columns(x: &[f32], widths: &[usize]) -> Vec<Vec<f32>> {
+    let row: usize = widths.iter().sum();
+    assert_eq!(x.len() % row, 0);
+    let rows = x.len() / row;
+    let mut parts: Vec<Vec<f32>> = widths
+        .iter()
+        .map(|w| Vec::with_capacity(rows * w))
+        .collect();
+    for r in x.chunks_exact(row) {
+        let mut at = 0;
+        for (part, &w) in parts.iter_mut().zip(widths) {
+            part.extend_from_slice(&r[at..at + w]);
+            at += w;
+        }
+    }
+    parts
+}
+
 /// Index of the largest value, the first one on a tie (as `torch.argmax`).
 pub fn argmax(x: &[f32]) -> u32 {
     let mut best = 0;
@@ -49,6 +69,17 @@ mod tests {
         let mut x = [1., 2.];
         add_in_place(&mut x, &[10., 20.]);
         assert_eq!(x, [11., 22.]);
+    }
+
+    #[test]
+    fn split_columns_cuts_every_row() {
+        // two rows of [a a | b | c c]
+        let x = [1., 2., 3., 4., 5., 6., 7., 8., 9., 10.];
+        let parts = split_columns(&x, &[2, 1, 2]);
+        assert_eq!(
+            parts,
+            [vec![1., 2., 6., 7.], vec![3., 8.], vec![4., 5., 9., 10.]]
+        );
     }
 
     #[test]

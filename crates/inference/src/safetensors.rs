@@ -1,7 +1,17 @@
 use std::{collections::HashMap, path::Path};
 
+/// Tensor name to (shape, flat row-major values).
+pub type Tensors = HashMap<String, (Vec<usize>, Vec<f32>)>;
+
+/// Removes and returns a tensor, naming it in the panic if the checkpoint lacks it.
+pub fn take(tensors: &mut Tensors, name: &str) -> (Vec<usize>, Vec<f32>) {
+    tensors
+        .remove(name)
+        .unwrap_or_else(|| panic!("checkpoint has no tensor {name}"))
+}
+
 /// Reads every tensor, widening BF16 to f32.
-pub fn load(path: &Path) -> HashMap<String, (Vec<usize>, Vec<f32>)> {
+pub fn load(path: &Path) -> Tensors {
     let bytes = std::fs::read(path).unwrap();
     let n = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
     let header_end = 8 + n as usize;
