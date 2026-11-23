@@ -2,7 +2,7 @@ use crate::byte_level::{build_char_to_byte, bytes_to_symbols, bytes_to_unicode};
 use crate::encode::{build_ranks, build_vocab_ids, encode_chunk};
 use crate::pretokenize::{GPT2_PATTERN, pre_tokenize};
 use crate::{
-    ENDOFTEXT, TOY_CORPUS, TOY_VOCAB_SIZE, Tokenizer, bytes_per_token, tokenize_by_byte,
+    ENDOFTEXT, TOY_CORPUS, TOY_VOCAB_SIZE, Tokenizer, bytes_per_token, chatml, tokenize_by_byte,
     tokenize_by_char, tokenize_by_word,
 };
 use fancy_regex::Regex;
@@ -581,6 +581,25 @@ fn qwen_decode_matches_huggingface() {
             "decode mismatch for {text:?}"
         );
     }
+}
+
+// The ids Hugging Face's `apply_chat_template` gives for the same two turns
+// (crates/inference/scripts/gen_reference.py prints them).
+#[test]
+fn chatml_ids_match_the_hugging_face_chat_template() {
+    let Some(tok) = qwen() else { return };
+    let prompt = chatml(
+        "You are a helpful coding assistant.",
+        "Write a Python function that returns the nth Fibonacci number.",
+    );
+    assert_eq!(
+        tok.encode(&prompt),
+        [
+            151644, 8948, 198, 2610, 525, 264, 10950, 10822, 17847, 13, 151645, 198, 151644, 872,
+            198, 7985, 264, 13027, 729, 429, 4675, 279, 55129, 79683, 1372, 13, 151645, 198,
+            151644, 77091, 198
+        ]
+    );
 }
 
 #[test]

@@ -7,6 +7,15 @@ use std::{cmp::Reverse, collections::HashMap, string::FromUtf8Error};
 
 pub const ENDOFTEXT: &str = "<|endoftext|>";
 
+/// One system turn and one user turn in ChatML, ending where the assistant's
+/// reply starts. This is the format Qwen's instruct models were trained on and
+/// what its chat template in `tokenizer_config.json` renders.
+pub fn chatml(system: &str, user: &str) -> String {
+    format!(
+        "<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"
+    )
+}
+
 // Everything encode and decode need, built once. An id is an index into
 // `vocab`, so the layout is whatever the constructor chose: training puts
 // <|endoftext|> first, the GPT-2 loader matches GPT-2's ids.

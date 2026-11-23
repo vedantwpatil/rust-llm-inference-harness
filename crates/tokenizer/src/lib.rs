@@ -8,7 +8,7 @@ mod train;
 
 pub use baseline::{tokenize_by_byte, tokenize_by_char, tokenize_by_word};
 pub use metrics::bytes_per_token;
-pub use tokenizer::{ENDOFTEXT, Tokenizer};
+pub use tokenizer::{ENDOFTEXT, Tokenizer, chatml};
 pub use train::{TOY_CORPUS, TOY_VOCAB_SIZE};
 
 #[cfg(test)]
