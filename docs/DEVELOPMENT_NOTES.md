@@ -82,13 +82,13 @@ The bar is Hugging Face's float32 forward pass on the same ids, compared at ever
 
 ### Why `Matrix` is `[out, in]`
 
-`y = x @ W^T` then reads one weight row and one activation row, both contiguous, per output: a dot product the kernel can stream. Llama's `nn.Linear` is already `[out, in]`, so stage 3 needs no second layout, and int8 scales can attach per output row. GPT-2's `Conv1D` is `[in, out]` and pays one transpose at load.
+`y = x @ W^T` then reads one weight row and one activation row, both contiguous, per output: a dot product the kernel can stream. Llama's `nn.Linear` is already `[out, in]`, so the Llama-style model needs no second layout, and int8 scales attach per output row. GPT-2's `Conv1D` is `[in, out]` and pays one transpose at load.
 
 ### Speed
 
 Decode reads every weight once per token and does about two operations per byte, so it is limited by memory bandwidth, not arithmetic. Roofline: `tokens/s = bandwidth / bytes read per token`. For GPT-2 that is 494 MB of f32 weights (the tied token embedding counts once, as the output projection) plus the KV cache, about 10 MB at 100 tokens of context.
 
-**The bandwidth a CPU can reach is not the spec sheet.** On an M3 Max (10 performance plus 4 efficiency cores) the specification says 300 GB/s but a streaming read through the CPU cores saturates near 110 to 127 GB/s, and four threads already get most of it. `bench_gpt2` measures it each run: best of 20 passes over 1 GiB with the model's own `dot`. An average hides cold or contended passes, and bandwidth is a ceiling. Against the spec number the roofline would be about 600 tokens/s and unreachable.
+**The bandwidth a CPU can reach is not the spec sheet.** On an M3 Max (10 performance plus 4 efficiency cores) the specification says 300 GB/s but a streaming read through the CPU cores saturates near 110 to 127 GB/s, and four threads already get most of it. `bench` measures it each run: best of 20 passes over 1 GiB with the model's own `dot`. An average hides cold or contended passes, and bandwidth is a ceiling. Against the spec number the roofline would be about 600 tokens/s and unreachable.
 
 **Why not rayon.** The first version used rayon's `par_chunks_mut`. Decode is about 60 tiny parallel regions per token (four matmuls and one attention per block, plus the output projection), and an empty rayon region measured 16 to 19 µs at 4 threads, about 45 µs at 8 and over 100 µs at 14 (workers asleep). That is a large share of a 5 ms token, and more threads made it worse: the best decode was 160 tokens/s at 4 to 5 threads, 121 at the default. `Pool` replaces it: workers spin about 200 µs after a region, then sleep, so back-to-back regions find them awake. The cost is that idle workers burn CPU for that window.
 
@@ -104,7 +104,7 @@ Decode reads every weight once per token and does about two operations per byte,
 
 On one core with data in cache `4,4,1` reaches about 113 GFLOP/s (the core's ceiling is roughly 128) and `4,1,4` about 64.
 
-**Where a token goes.** `bench_gpt2` wraps the backend in a timing `Backend` and prints milliseconds per op. That is what found two prefill costs a guess at the matmul would have missed: scalar `gelu` was about a third of prefill, and the serial `[n_out][t]` to `[t][n_out]` transpose in `matmul` about a third of what was left. Both now run on the pool.
+**Where a token goes.** `bench` wraps the backend in a timing `Backend` and prints milliseconds per op. That is what found two prefill costs a guess at the matmul would have missed: scalar `gelu` was about a third of prefill, and the serial `[n_out][t]` to `[t][n_out]` transpose in `matmul` about a third of what was left. Both now run on the pool.
 
 **Results**, 103-token prompt, 8 threads, median run. Roofline from the bandwidth measured in the same run.
 
@@ -117,3 +117,53 @@ On one core with data in cache `4,4,1` reaches about 113 GFLOP/s (the core's cei
 Prefill is about 440 GFLOP/s (17.5 GFLOP for the prompt in about 40 ms). Decode matmul runs at about 107 GB/s of the roughly 120 GB/s probe, so what is left of the gap to the roofline is spread thin: `gelu` and attention take about 0.3 ms each of 5.3 ms, and each parallel region still pays a small wake-up and join cost.
 
 **Not done.** Layer norm and the residual adds are serial (about 3 ms of a 40 ms prefill, negligible in decode). Every `Backend` call allocates a fresh `Vec` for its output.
+
+## Stage 3: a Llama-style model and int8
+
+The checkpoint is Qwen2.5-Coder-0.5B-Instruct: 24 layers, width 896, 14 query heads sharing 2 key/value heads, head dimension 64, feed-forward width 4864, vocabulary 151,936, tied output projection, BF16 on disk. It is a coder model (stage 5 needs one) and small enough to iterate on. Nothing in the code is Qwen specific: sizes, rope base and scaling, tied embeddings and projection biases are read from `config.json` and the tensor list, and a randomly initialised Llama with an untied projection and Llama 3 rope scaling passes the same checks.
+
+### Verification
+
+Same method as stage 2 (every layer boundary, greedy `generate`, cached against recomputed decode), run by the same three functions on both models. Float32 results: every layer within about `1.1e-5` of the tensor's scale (bar `1e-4`), greedy ids equal, cached decode within `1e-5`. BF16 widens to float32 by a 16-bit shift, exact, so Rust and PyTorch read the same numbers.
+
+Two things the Qwen checkpoint cannot show, so they have their own tests:
+
+- **Llama 3 rope scaling.** Qwen has none. `tiny-llama3` is built so the three bands (kept, blended, divided) each hold at least one frequency and the prompt runs past the original context. The test fails with the scaling switched off, so it does check it. The frequencies themselves are also compared with values computed by Hugging Face.
+- **Rotate-half pairing.** Element `j` pairs with `j + head_dim / 2`, not `2j` with `2j + 1`. The wrong pairing gives plausible text, so a layer-by-layer match is the only protection; block 0's attention output is the first place it would show.
+
+The chat prompt is checked as ids: `chatml` produces the ids Hugging Face's `apply_chat_template` produces. The Qwen tokenizer built from `tokenizer.json` matches Hugging Face's `tokenizers` on the shared oracle cases plus Qwen's own special tokens, in both directions. Cases NFC would change are left out of the oracle, see below.
+
+### Fused projections
+
+Query, key and value are one `[q_dim + 2 * kv_dim, hidden]` matrix and gate and up are one `[2 * intermediate, hidden]` matrix, stacked at load. A decode token then makes 4 matmul calls per layer instead of 7, and each call is a parallel region with a fixed wake-up and join cost ([Speed](#speed)). The price is a split of the result per token, which is a copy of a few kilobytes.
+
+### Int8
+
+Weight-only, per output row, symmetric: `scale = max|row| / 127`, values rounded to nearest. Per-row, not per-group: one scale per row keeps the kernel a plain dot product with one multiply at the end, and the measured error (below) did not call for more.
+
+**What it costs in accuracy.** Over a text sample, 98.2% of positions have the same top-1 token as float32 and perplexity rises by 0.30%. Logits on the verification prompt are within `1.5e-2` of Hugging Face's, relative to the logits' scale. With the top token different at about 1 position in 55, greedy output eventually diverges from float32's; that is the expected shape of quantization error, which is why the `1e-4` bar does not apply.
+
+**What it buys.** Weight bytes per token fall from 1976 MB to 496 MB. Decode goes from about 53 to about 146 tokens/s, 2.7 times, not 4.
+
+| Qwen2.5-Coder-0.5B, 101-token prompt, 8 threads | Prefill (tokens/s) | Decode (tokens/s) | Decode share of its roofline |
+| ----------------------------------------------- | ------------------ | ----------------- | ---------------------------- |
+| float32                                         | about 835          | about 53          | about 83%                    |
+| int8                                            | about 740          | about 146         | about 58%                    |
+
+**Why 2.7 and not 4.** The int8 decode kernel moves about 77 GB/s of the roughly 125 GB/s the machine streams, so it is not waiting on memory. It is limited by instructions: each 16 weights are loaded as one vector, then widened int8 to int16 to int32 to f32 in registers before four fused multiply-adds. That is more instructions per byte than the float32 kernel, which does one load and one multiply-add per 4 weights. Of the 6.9 ms per token, about 0.5 ms is attention, norms, `swiglu` and the residual adds, which quantization does not touch (Amdahl). The step past this is to quantize the activations too and use the integer dot-product instruction (`sdot`), which does 16 multiply-adds per instruction with no widening. That changes the numerics (activations are rounded as well), so it needs its own accuracy check and is not done.
+
+**Tried and dropped.** Reading 2 or 4 weight rows per pass in the int8 kernel (reusing each activation load, as the float32 `tile` does) measured slower: about 137 and 124 tokens/s against 146 for one row. The extra live accumulators and the larger loop body cost more than the activation loads they save, since those loads hit L1.
+
+**Prefill is slightly slower with int8.** It is compute-bound, so fewer bytes do not help, and each 16-row slab is widened to float32 in a per-thread scratch buffer before the float32 tiles run. A native int8 matmul with activation quantization would fix that too.
+
+**What stays float32.** Norm weights and biases (tiny, and their error is not averaged away by a dot product) and the activations and KV cache. The token embedding table is quantized; the tied output projection reads the same matrix, and it is the largest tensor (136M of the 494M parameters).
+
+### Tokenizer as data
+
+`Tokenizer::from_tokenizer_json` takes the vocabulary, merges, pre-tokenizer regex and added tokens from the file, so the stage 1 encoder runs unchanged on a 151K vocabulary. All added tokens act as specials, as in Hugging Face. The `tokenizer.json` normalizer (Unicode NFC for Qwen) is not implemented: text that is not already NFC can encode to different ids than Hugging Face gives.
+
+### Speed
+
+Same roofline as stage 2: `bandwidth / (weight bytes + KV bytes)`. Float32 Qwen decode reaches about 83% of it, GPT-2 about 77%, so the Llama-style model is not slower per byte. Prefill pushes 101 tokens through 358M matrix-multiplied parameters (the embedding table is only read for the last row): about 72 GFLOP in 120 ms, or 600 GFLOP/s, against 440 for GPT-2. Prefill tokens/s is lower than GPT-2's (about 835 against 2600) because each token costs 4 times the arithmetic.
+
+**Not done.** `layernorm`, `rmsnorm`, `rope` and the residual adds are serial, which is under 2 ms of a 120 ms prefill. `swiglu` calls scalar `exp` per element, 3.6 ms of prefill. The default of 8 threads was chosen on one machine and holds for int8 too (12 and 14 threads were slower). Comparison with llama.cpp and mlx-lm is not done: neither is installed here.

@@ -6,7 +6,7 @@ Cargo workspace, one crate per layer:
 
 - `crates/tokenizer`: the library.
 - `crates/tokenizer-cli`: demo binary (`main.rs`). `take_input` reads the prompt from a positional arg (no `clap`). Prints compression for word, char, byte, trained BPE and GPT-2 BPE.
-- `crates/inference`: the model side. Safetensors loader, a `Backend` trait with a CPU implementation, the GPT-2 forward pass with a KV cache. Modules in [Inference modules](#inference-modules).
+- `crates/inference`: the model side. Safetensors loader, a `Backend` trait with a CPU implementation, GPT-2 and Llama-style (Llama, Qwen2) forward passes with a KV cache, weight-only int8. Modules in [Inference modules](#inference-modules).
 
 ## Tokenizer modules
 
@@ -19,10 +19,12 @@ A tokenizer is normalizer, then pre-tokenizer, then model. This one has no norma
 | `byte_level`  | `bytes_to_unicode`: GPT-2's byte to printable-char table, `[char; 256]` indexed by byte                                                                  |
 | `train`       | `tokenize_bpe` (the trainer), `compute_pair_freqs`, `merge_pairs`                                                                                       |
 | `encode`      | `encode_chunk`: replays merges on one chunk, lowest rank first. `build_ranks`, `build_vocab_ids`                                                         |
-| `tokenizer`   | `Tokenizer { vocab, merges, ranks, vocab_ids, pattern, specials, .. }`: `train`, `from_gpt2_merges`, `encode`, `decode`, `decode_stream`                 |
+| `tokenizer`   | `Tokenizer { vocab, merges, ranks, vocab_ids, pattern, specials, .. }`: `train`, `from_gpt2_merges`, `from_tokenizer_json`, `encode`, `decode`, `decode_stream`. `chatml` |
 | `metrics`     | `bytes_per_token`                                                                                                                                       |
 
 `encode` cuts special tokens out first, then pre-tokenizes and replays merges. `decode` joins bytes across tokens and builds the `String` once at the end. `decode_stream(id, &mut pending)` is the one-id-at-a-time version: the caller owns `pending`, an incomplete UTF-8 tail stays in it. Both share `token_bytes`.
+
+`from_tokenizer_json` reads a Hugging Face `tokenizer.json` (Llama 3, Qwen): vocabulary, merges, the `Split` regex of the pre-tokenizer and every added token, so none of them is a constant. Added tokens are all specials, as in Hugging Face. The file's normalizer is ignored. `chatml(system, user)` renders the turn format Qwen was trained on.
 
 ## Data flow
 
@@ -69,21 +71,27 @@ Encode and decode: pre-split, bytes to unicode, merge by rank; and back through 
 
 | Module        | Holds                                                                                                                                                         |
 | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `safetensors` | `load`: 8-byte header length, JSON header, raw bytes, into `HashMap<String, (Vec<usize>, Vec<f32>)>` (tensor name to shape and flat row-major values)          |
-| `backend`     | `Matrix { rows, cols, data }`, `AttnShape`, the `Backend` trait: `matmul`, `layernorm`, `gelu`, `softmax`, `attention`                                         |
-| `cpu`         | `CpuBackend { pool }`: the reference `Backend`. Parallel across a `Pool`, matmul through `kernel::tile`                                                       |
-| `kernel`      | `tile<R, T, U>`: `R` weight rows against `T` activation rows, NEON on aarch64, scalar elsewhere. `dot` is the 1 by 1 case                                     |
+| `safetensors` | `load`: 8-byte header length, JSON header, raw bytes (F32 or BF16, widened to f32) into `Tensors`, a `HashMap` from tensor name to shape and flat row-major values. `take` removes one by name |
+| `backend`     | `Matrix { rows, cols, weights }` with `Weights::{F32, Q8}`, `AttnShape`, the `Backend` trait: `matmul`, `layernorm`, `rmsnorm`, `gelu`, `swiglu`, `rope`, `softmax`, `attention` |
+| `cpu`         | `CpuBackend { pool }`: the reference `Backend`. Parallel across a `Pool`, matmul through `kernel`                                                             |
+| `kernel`      | `tile<R, T, U>`: `R` weight rows against `T` activation rows, NEON on aarch64, scalar elsewhere. `dot` is the 1 by 1 case. `dot_q8`: int8 row against f32 row    |
 | `pool`        | `Pool`: persistent fork-join thread pool. `run(n_tasks, f)`, `for_each_chunk_mut(slice, chunk, f)`                                                            |
 | `kv_cache`    | `KvCache`: per layer, keys and values as flat `[position][kv_dim]` vectors, plus the number of positions held                                                 |
-| `ops`         | `embed`, `add_in_place`, `argmax`                                                                                                                             |
-| `gpt2`        | `Gpt2<B: Backend>`: `from_tensors`, `new_cache`, `forward` (logits for the next token), `forward_trace` (every intermediate), `generate_greedy`               |
+| `ops`         | `embed`, `add_in_place`, `argmax`, `split_columns`                                                                                                            |
+| `model`       | `Model` trait: `new_cache`, `forward`, `forward_trace`, `weight_bytes`, and the provided greedy loop `generate_each` / `generate_greedy`. `Trace`              |
+| `gpt2`        | `Gpt2<B: Backend>`: `from_tensors`, implements `Model`                                                                                                        |
+| `config`      | `LlamaConfig::from_json`: sizes, norm epsilon, rope base, tied embeddings, end-of-sequence ids, optional Llama 3 `RopeScaling`. `inv_freq`                    |
+| `llama`       | `Llama<B: Backend>`: `from_dir`, `from_tensors`, `quantize`, implements `Model`                                                                               |
 
 ### Contracts
 
 - **`Matrix` is `[out, in]`, row-major.** `matmul(x, t, w, bias)` computes `y = x @ w^T + bias` for `t` rows of `x`, so output `o` for one token is a dot product of two contiguous slices. Hugging Face's GPT-2 `Conv1D` weights are `[in, out]` and are transposed once at load.
 - **One attention op for prefill, decode and grouped-query attention.** `AttnShape { t, pos0, n_heads, n_kv_heads, head_dim }`: `t` new queries sit at positions `pos0..pos0 + t`, and `k`, `v` hold all `pos0 + t` positions. Query `i` scores keys `0..=pos0 + i`, which is the causal mask. Query head `h` reads key/value head `h / (n_heads / n_kv_heads)`. Full multi-head attention is `n_kv_heads == n_heads`.
 - **`KvCache` is appended per layer, then advanced once.** A layer's keys and values are `append`ed during the pass, `advance(t)` runs after the last layer, so `len()` is the position of the next token for every layer in between. Position embeddings are offset by `len()`.
-- **`forward_trace` keys match the reference fixture:** `embed`, `block0.ln_1`, `block0.attn`, `block0.ln_2`, `block0.mlp`, `block.N`, `ln_f`, `logits` (every position).
+- **`forward_trace` keys match the reference fixture, for every model:** `embed`, `block0.ln_1`, `block0.attn`, `block0.ln_2`, `block0.mlp`, `block.N`, `ln_f`, `logits` (every position). That is what lets one set of checks in `reference.rs` run on any `Model`.
+- **`Model` is object safe.** The examples hold a `Box<dyn Model>`; `generate_each` takes `&mut dyn FnMut(u32)` so a caller can stream tokens.
+- **`rope` rotates "half" pairs.** In each head, element `j` pairs with element `j + head_dim / 2`, the layout Hugging Face's Llama weights assume. The frequencies come in as data (`LlamaConfig::inv_freq`), so the Llama 3 scaling is not in the op.
+- **A quantized `Matrix` is still a `Matrix`.** `matmul` takes the same arguments for both storage kinds; `Matrix::quantize` swaps the storage in place.
 
 ### Forward pass
 
@@ -101,12 +109,41 @@ ids ─▶ embed (wte[id] + wpe[pos0 + i]) ─▶ x [t, width]
 cache.advance(t) ─▶ layernorm ─▶ last row @ wte^T ─▶ logits [vocab]
 ```
 
+Llama-style block, with the fused projections the loader builds by stacking weight rows:
+
+```text
+ids ─▶ embedding rows ─▶ x [t, hidden]
+        │
+        │  per layer l:
+        │    h = rmsnorm(x)
+        │    qkv = matmul(h, [q_proj; k_proj; v_proj] (+ bias for Qwen2))   split into q | k | v
+        │    rope(q), rope(k)                                               position = cache.len() + row
+        │    cache.append(l, k, v)
+        │    x += matmul(attention(q, cache), o_proj)                       n_kv_heads < n_heads
+        │    gate_up = matmul(rmsnorm(x), [gate_proj; up_proj])
+        │    x += matmul(swiglu(gate_up), down_proj)                        silu(gate) * up
+        ▼
+cache.advance(t) ─▶ rmsnorm ─▶ last row @ (lm_head or embedding)^T ─▶ logits [vocab]
+```
+
+Everything that differs between checkpoints is read from `config.json` or the tensor list: sizes, `head_dim`, the rope base and scaling, tied embeddings, and whether the query, key and value projections have biases (Qwen2 yes, Llama no: the loader checks for the tensor).
+
+### Weight-only int8
+
+`Weights::Q8 { values: Vec<i8>, scales: Vec<f32> }`: row `r` is `scales[r] * values[r * cols..]`, scale `max|row| / 127`. Norm weights and biases stay f32. `Llama::quantize` converts every weight matrix including the token embedding table; its lookup widens one row. Activations stay f32 throughout.
+
+`CpuBackend::matmul` picks the path by token count. One token (decode) runs `dot_q8` straight over the int8 rows. Several tokens widen each task's 16-row slab to f32 in a per-thread scratch buffer and run the f32 `tile` kernels, because prefill reuses each weight across tokens and is compute-bound, where reading fewer bytes does not help.
+
 ### Parallelism
 
 `Pool::new(n)` starts `n - 1` workers; the calling thread is the n-th. A region publishes a job (task count, an atomic next-task counter, an atomic done counter) and every thread claims task indices until none are left. Workers spin on an atomic generation counter for a short window after each region, then sleep on a condition variable. A region with one task runs inline. One region runs at a time; a task panic is caught per task and re-raised by `run` after the region ends. Why this instead of rayon: [DEVELOPMENT_NOTES.md](DEVELOPMENT_NOTES.md#stage-2-gpt-2-on-the-cpu).
 
-`CpuBackend::matmul` gives each task 16 whole weight rows and every token's dot product with them, so a weight row is read from memory once however many tokens there are. The result is `[n_out][t]` and a second parallel pass transposes it to `[t][n_out]` and adds the bias. `attention` is one task per (query, head).
+`CpuBackend::matmul` gives each task 16 whole weight rows and every token's dot product with them, so a weight row is read from memory once however many tokens there are. The result is `[n_out][t]` and a second parallel pass transposes it to `[t][n_out]` and adds the bias; for one token the layout is already right, so the first pass adds the bias and the second is skipped. `attention` is one task per (query, head). `swiglu` and `gelu` run on the pool in flat chunks, `rope` and the norms are serial.
 
 ### Verification fixtures
 
-`crates/inference/data/gpt2/` is gitignored. `scripts/fetch_model.py` downloads a checkpoint, `scripts/gen_reference.py` runs Hugging Face on a fixed prompt and writes `reference.safetensors` (ids, every traced activation, greedy ids). Tests skip when the files are missing.
+`crates/inference/data/<name>/` is gitignored: `gpt2`, `qwen2.5-coder-0.5b`, `tiny-llama3`. `scripts/fetch_model.py` downloads a checkpoint, `scripts/gen_reference.py <name>` runs Hugging Face in float32 on a fixed prompt and writes `reference.safetensors` (ids, every traced activation, greedy ids). `tiny-llama3` is generated by that script: a random Llama with an untied output projection, no biases and Llama 3 rope scaling, small enough to run in milliseconds. `reference.rs` holds the three checks every model runs against its fixture (layers, greedy, cached decode); tests skip when the files are missing.
+
+### Examples
+
+`crates/inference/examples/`: `bench` (prefill and decode against the bandwidth roofline, `--int8`), `chat` (streams a reply), `eval_int8` (next-token agreement and perplexity, f32 against int8). `common/mod.rs` holds the checkpoint paths and loaders they share.
