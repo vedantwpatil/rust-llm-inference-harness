@@ -18,11 +18,38 @@ pub fn embed(wte: &[f32], wpe: &[f32], ids: &[u32], w: usize) -> Vec<f32> {
     final_vec
 }
 
+/// The residual connection: `x += y`.
+pub fn add_in_place(x: &mut [f32], y: &[f32]) {
+    assert_eq!(x.len(), y.len());
+    for (a, b) in x.iter_mut().zip(y) {
+        *a += b;
+    }
+}
+
+/// Index of the largest value, the first one on a tie (as `torch.argmax`).
+pub fn argmax(x: &[f32]) -> u32 {
+    let mut best = 0;
+    for (i, v) in x.iter().enumerate() {
+        if *v > x[best] {
+            best = i;
+        }
+    }
+    best as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::safetensors::load;
     use std::path::Path;
+
+    #[test]
+    fn argmax_takes_first_of_ties() {
+        assert_eq!(argmax(&[1., 5., 5., 2.]), 1);
+        let mut x = [1., 2.];
+        add_in_place(&mut x, &[10., 20.]);
+        assert_eq!(x, [11., 22.]);
+    }
 
     #[test]
     fn embed_toy() {
