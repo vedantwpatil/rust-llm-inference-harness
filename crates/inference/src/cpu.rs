@@ -119,7 +119,7 @@ fn performance_cores() -> Option<usize> {
             old_len: *mut usize,
             new: *mut std::ffi::c_void,
             new_len: usize,
-        ) -> i32;
+        ) -> std::ffi::c_int;
     }
     let (mut n, mut len) = (0i32, size_of::<i32>());
     // SAFETY: the name is NUL-terminated and `old` has room for `len` bytes.

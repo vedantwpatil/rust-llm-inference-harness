@@ -7,7 +7,7 @@
 //! atomic operations when the pool is busy.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::*};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -23,6 +23,8 @@ struct Job {
     /// `Job::work`.
     f: *const (dyn Fn(usize) + Sync),
     n_tasks: usize,
+    /// Threads that may work on it, the caller included.
+    width: usize,
     /// Next task index nobody has claimed.
     next: AtomicUsize,
     /// Tasks that have finished running.
@@ -71,7 +73,8 @@ struct Shared {
     /// Threads taking part in the current region, the caller included: workers
     /// `1..width` join, the rest skip it without touching the lock.
     width: AtomicUsize,
-    sleeping: AtomicUsize,
+    /// Bit `i` is set while worker `i` sleeps on `wake`.
+    sleeping: AtomicU64,
     wake: Condvar,
     shutdown: AtomicBool,
 }
@@ -86,6 +89,7 @@ pub struct Pool {
 impl Pool {
     /// A pool of `threads` threads in total: the caller of `run` is one of them.
     pub fn new(threads: usize) -> Self {
+        assert!(threads <= 64, "`Shared::sleeping` has one bit per thread");
         let shared = Arc::new(Shared {
             state: Mutex::new(State {
                 generation: 0,
@@ -93,7 +97,7 @@ impl Pool {
             }),
             generation: AtomicUsize::new(0),
             width: AtomicUsize::new(0),
-            sleeping: AtomicUsize::new(0),
+            sleeping: AtomicU64::new(0),
             wake: Condvar::new(),
             shutdown: AtomicBool::new(false),
         });
@@ -136,6 +140,7 @@ impl Pool {
         let job = Arc::new(Job {
             f,
             n_tasks,
+            width,
             next: AtomicUsize::new(0),
             done: AtomicUsize::new(0),
             panicked: AtomicBool::new(false),
@@ -148,7 +153,10 @@ impl Pool {
             self.shared.width.store(width, Relaxed);
             self.shared.generation.store(state.generation, Release);
         }
-        if self.shared.sleeping.load(Acquire) > 0 {
+        // Only a sleeper this region needs is worth a system call: workers
+        // outside its width sleep through a run of narrow regions.
+        let needed = u64::MAX >> (64 - width.min(64)) & !1;
+        if self.shared.sleeping.load(Acquire) & needed != 0 {
             self.shared.wake.notify_all();
         }
 
@@ -208,9 +216,10 @@ impl Pool {
 }
 
 fn worker(shared: &Shared, id: usize) {
+    let bit = 1 << id;
     let mut seen = 0;
+    let mut spin_until = Instant::now() + SPIN;
     loop {
-        let spin_until = Instant::now() + SPIN;
         let mut polls = 0u32;
         while shared.generation.load(Acquire) == seen {
             if shared.shutdown.load(Relaxed) {
@@ -223,31 +232,34 @@ fn worker(shared: &Shared, id: usize) {
                 // Re-checked under the lock: `run` publishes under it too, so
                 // either it already did (no sleep) or it will see `sleeping`.
                 while state.generation == seen && !shared.shutdown.load(Relaxed) {
-                    shared.sleeping.fetch_add(1, Release);
+                    shared.sleeping.fetch_or(bit, Release);
                     state = shared.wake.wait(state).unwrap();
-                    shared.sleeping.fetch_sub(1, Release);
+                    shared.sleeping.fetch_and(!bit, Release);
                 }
                 break;
             }
             std::hint::spin_loop();
         }
         // The width was stored before the generation this worker just saw, so a
-        // region that leaves it out costs it one load and no lock. (If a newer
-        // region has already replaced the width, this worker sits out that one
-        // too: only the parallelism of one region is lost, never a task.)
+        // region that leaves it out costs it one load and no lock. The timer is
+        // not restarted: a worker left out of region after region goes to sleep.
+        // (If a newer region has already replaced the width, this worker sits
+        // out that one too: one region's parallelism is lost, never a task.)
         if id >= shared.width.load(Relaxed) {
             seen = shared.generation.load(Acquire);
             continue;
         }
-        // A worker that missed a whole region just takes the newest job.
+        // A worker that missed a whole region just takes the newest job, and
+        // checks the width of that one: it may be narrower than the last.
         let job = {
             let state = shared.state.lock().unwrap();
             seen = state.generation;
             state.job.clone()
         };
-        if let Some(job) = job {
+        if let Some(job) = job.filter(|job| id < job.width) {
             job.work();
         }
+        spin_until = Instant::now() + SPIN;
     }
 }
 
@@ -282,16 +294,23 @@ mod tests {
     #[test]
     fn a_narrow_region_uses_at_most_its_width() {
         let pool = Pool::new(6);
-        for width in [1, 2, 4, 6, 100] {
-            let threads = std::sync::Mutex::new(std::collections::HashSet::new());
-            // Tasks long enough that every thread allowed in gets a share.
-            pool.run_width(width, 64, &|_| {
+        // Rising, falling and back to back, with tasks long enough that every
+        // thread allowed in gets a share; the quiet gap sends workers to sleep.
+        for round in 0..60 {
+            if round == 30 {
+                thread::sleep(Duration::from_millis(20));
+            }
+            let width = [100, 1, 6, 2, 3, 6, 2][round % 7];
+            let threads = Mutex::new(std::collections::HashSet::new());
+            pool.run_width(width, 24, &|_| {
                 threads.lock().unwrap().insert(thread::current().id());
-                thread::sleep(Duration::from_micros(200));
+                thread::sleep(Duration::from_micros(100));
             });
             let used = threads.lock().unwrap().len();
-            assert!(used <= width.min(6), "width {width} used {used}");
-            assert!(used >= 1);
+            assert!(
+                used <= width.min(6),
+                "round {round}: width {width} used {used}"
+            );
         }
     }
 
