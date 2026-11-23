@@ -1,11 +1,15 @@
 pub mod backend;
+pub mod config;
 pub mod cpu;
 pub mod gpt2;
 pub mod kernel;
 pub mod kv_cache;
+pub mod llama;
 pub mod model;
 pub mod ops;
 pub mod pool;
+#[cfg(test)]
+mod reference;
 pub mod safetensors;
 
 /// The largest `|got - want|` is at most `rel * max|want|`: error measured

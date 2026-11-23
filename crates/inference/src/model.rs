@@ -21,6 +21,11 @@ pub trait Model {
     /// the last of `ids`.
     fn forward(&self, ids: &[u32], cache: &mut KvCache) -> Vec<f32>;
 
+    /// Like `forward` from an empty cache, but returns every intermediate
+    /// activation under the names `reference.rs` and the reference script
+    /// share, and logits for every position under "logits".
+    fn forward_trace(&self, ids: &[u32]) -> Trace;
+
     /// Greedy decoding: the prompt followed by up to `max_new` argmax tokens,
     /// stopping after one that is in `eos`.
     fn generate_greedy(&self, prompt: &[u32], max_new: usize, eos: &[u32]) -> Vec<u32> {

@@ -128,6 +128,57 @@ impl Backend for CpuBackend {
         out
     }
 
+    fn rmsnorm(&self, x: &[f32], gamma: &[f32], eps: f32) -> Vec<f32> {
+        let width = gamma.len();
+        assert_eq!(x.len() % width, 0);
+        let mut out = Vec::with_capacity(x.len());
+        for row in x.chunks_exact(width) {
+            let mean_sq = dot(row, row) / width as f32;
+            let scale = 1.0 / (mean_sq + eps).sqrt();
+            out.extend(row.iter().zip(gamma).map(|(v, g)| v * scale * g));
+        }
+        out
+    }
+
+    fn swiglu(&self, gate_up: &[f32], width: usize) -> Vec<f32> {
+        assert_eq!(gate_up.len() % (2 * width), 0);
+        let mut out = vec![0.0; gate_up.len() / 2];
+        // Chunks over the flat output, not one per row: a decoded token is a
+        // single row and would otherwise run on one thread.
+        const CHUNK: usize = 512;
+        self.pool.for_each_chunk_mut(&mut out, CHUNK, |c, chunk| {
+            let (mut row, mut j) = ((c * CHUNK) / width, (c * CHUNK) % width);
+            for v in chunk {
+                let g = gate_up[row * 2 * width + j];
+                *v = g / (1.0 + (-g).exp()) * gate_up[row * 2 * width + width + j];
+                j += 1;
+                if j == width {
+                    (row, j) = (row + 1, 0);
+                }
+            }
+        });
+        out
+    }
+
+    fn rope(&self, x: &mut [f32], pos0: usize, n_heads: usize, head_dim: usize, inv_freq: &[f32]) {
+        let half = head_dim / 2;
+        assert_eq!(inv_freq.len(), half);
+        assert_eq!(x.len() % (n_heads * head_dim), 0);
+        for (i, row) in x.chunks_exact_mut(n_heads * head_dim).enumerate() {
+            let pos = (pos0 + i) as f32;
+            // The angles depend on the position and pair index only, so every head shares them.
+            let angles: Vec<(f32, f32)> = inv_freq.iter().map(|f| (pos * f).sin_cos()).collect();
+            for head in row.chunks_exact_mut(head_dim) {
+                let (lo, hi) = head.split_at_mut(half);
+                for (j, &(sin, cos)) in angles.iter().enumerate() {
+                    let (a, b) = (lo[j], hi[j]);
+                    lo[j] = a * cos - b * sin;
+                    hi[j] = b * cos + a * sin;
+                }
+            }
+        }
+    }
+
     fn gelu(&self, x: &mut [f32]) {
         const SQRT_2_OVER_PI: f32 = 0.797_884_6;
         // A scalar tanh per element: serial it was a third of prefill time. A
@@ -247,6 +298,64 @@ mod tests {
         // [1, 3] and [10, 14] (different mean and spread) land on the same output
         let got = cpu().layernorm(&[1., 3., 10., 14.], &[2., 2.], &[1., 1.], 0.0);
         assert_close(&got, &[-1., 3., -1., 3.], 1e-6, 0.0);
+    }
+
+    #[test]
+    fn rmsnorm_toy() {
+        // mean square 12.5, so every value is divided by sqrt(12.5) = 3.5355339
+        let got = cpu().rmsnorm(&[3., 4.], &[1., 2.], 0.0);
+        assert_close(&got, &[0.8485281, 2.2627417], 1e-6, 0.0);
+    }
+
+    #[test]
+    fn swiglu_toy() {
+        // one row, width 2: silu(1) * 2 and silu(-1) * 3
+        let got = cpu().swiglu(&[1., -1., 2., 3.], 2);
+        assert_close(&got, &[1.4621172, -0.8068243], 1e-6, 0.0);
+        // more rows than one chunk, so the flat-index walk crosses row ends
+        let (rows, width) = (3, 700);
+        let x = data(rows * 2 * width, 5);
+        let got = cpu().swiglu(&x, width);
+        for r in 0..rows {
+            for j in 0..width {
+                let (g, u) = (x[r * 2 * width + j], x[r * 2 * width + width + j]);
+                assert!((got[r * width + j] - g / (1.0 + (-g).exp()) * u).abs() < 1e-6);
+            }
+        }
+    }
+
+    #[test]
+    fn rope_rotates_half_pairs() {
+        // head_dim 4: elements 0 and 2 pair, 1 and 3 pair. At position 1 a
+        // quarter turn (pi / 2) sends (1, 0) to (0, 1) and leaves the other
+        // pair, whose frequency is 0, alone.
+        let mut x = [1., 5., 0., 7.];
+        cpu().rope(&mut x, 1, 1, 4, &[std::f32::consts::FRAC_PI_2, 0.0]);
+        assert_close(&x, &[0., 5., 1., 7.], 1e-6, 0.0);
+    }
+
+    #[test]
+    fn rope_position_zero_is_identity_and_offset_matches() {
+        let (n_heads, head_dim) = (3, 8);
+        let inv_freq: Vec<f32> = (0..4).map(|j| 10000f32.powf(-(j as f32) / 4.0)).collect();
+        let x = data(4 * n_heads * head_dim, 9);
+        let mut all = x.clone();
+        cpu().rope(&mut all, 0, n_heads, head_dim, &inv_freq);
+        assert_close(
+            &all[..n_heads * head_dim],
+            &x[..n_heads * head_dim],
+            1e-7,
+            0.0,
+        );
+        // The property the KV cache relies on: row 3 rotated alone at pos0 = 3
+        // equals row 3 of the full pass.
+        let row = n_heads * head_dim;
+        let mut last = x[3 * row..].to_vec();
+        cpu().rope(&mut last, 3, n_heads, head_dim, &inv_freq);
+        assert_close(&last, &all[3 * row..], 1e-7, 0.0);
+        // A rotation does not change length.
+        let norm = |v: &[f32]| v.iter().map(|a| a * a).sum::<f32>();
+        assert!((norm(&all) - norm(&x)).abs() < 1e-4);
     }
 
     #[test]

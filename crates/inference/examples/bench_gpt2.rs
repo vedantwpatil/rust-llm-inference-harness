@@ -51,10 +51,19 @@ fn memory_bandwidth() -> f64 {
 /// Wraps a backend and adds up the time spent in each op: where a token goes.
 struct Timed<B> {
     inner: B,
-    secs: RefCell<[f64; 5]>,
+    secs: RefCell<[f64; 8]>,
 }
 
-const OPS: [&str; 5] = ["matmul", "layernorm", "gelu", "softmax", "attention"];
+const OPS: [&str; 8] = [
+    "matmul",
+    "layernorm",
+    "gelu",
+    "softmax",
+    "attention",
+    "rmsnorm",
+    "swiglu",
+    "rope",
+];
 
 impl<B: Backend> Timed<B> {
     fn time<R>(&self, op: usize, f: impl FnOnce(&B) -> R) -> R {
@@ -81,6 +90,15 @@ impl<B: Backend> Backend for Timed<B> {
     fn attention(&self, q: &[f32], k: &[f32], v: &[f32], shape: AttnShape) -> Vec<f32> {
         self.time(4, |b| b.attention(q, k, v, shape))
     }
+    fn rmsnorm(&self, x: &[f32], gamma: &[f32], eps: f32) -> Vec<f32> {
+        self.time(5, |b| b.rmsnorm(x, gamma, eps))
+    }
+    fn swiglu(&self, gate_up: &[f32], width: usize) -> Vec<f32> {
+        self.time(6, |b| b.swiglu(gate_up, width))
+    }
+    fn rope(&self, x: &mut [f32], pos0: usize, n_heads: usize, head_dim: usize, inv_freq: &[f32]) {
+        self.time(7, |b| b.rope(x, pos0, n_heads, head_dim, inv_freq))
+    }
 }
 
 /// Milliseconds per op for one prefill of `ids` and per decoded token, plus
@@ -91,10 +109,10 @@ fn breakdown(tensors: Tensors, ids: &[u32]) {
         tensors,
         Timed {
             inner: CpuBackend::default(),
-            secs: RefCell::new([0.0; 5]),
+            secs: RefCell::new([0.0; 8]),
         },
     );
-    let report = |label: &str, total: f64, secs: [f64; 5], per: f64| {
+    let report = |label: &str, total: f64, secs: [f64; 8], per: f64| {
         let parts: Vec<String> = OPS
             .iter()
             .zip(secs)

@@ -14,6 +14,11 @@ impl Matrix {
         assert_eq!(data.len(), rows * cols);
         Self { rows, cols, data }
     }
+
+    /// Appends row `i` to `out`: an embedding lookup.
+    pub fn push_row(&self, i: usize, out: &mut Vec<f32>) {
+        out.extend_from_slice(&self.data[i * self.cols..(i + 1) * self.cols]);
+    }
 }
 
 /// Shape of one attention call. `t` new tokens (queries) sit at absolute
@@ -41,8 +46,23 @@ pub trait Backend {
     /// then scales by `gamma` and shifts by `beta`.
     fn layernorm(&self, x: &[f32], gamma: &[f32], beta: &[f32], eps: f32) -> Vec<f32>;
 
+    /// Scales each `gamma.len()`-long row of `x` by `1 / sqrt(mean(x^2) + eps)`,
+    /// then by `gamma`: no mean subtraction, no bias.
+    fn rmsnorm(&self, x: &[f32], gamma: &[f32], eps: f32) -> Vec<f32>;
+
     /// GPT-2's tanh approximation of GELU, in place.
     fn gelu(&self, x: &mut [f32]);
+
+    /// SwiGLU gate. `gate_up` holds rows of `[gate | up]`, each `2 * width`
+    /// values; returns rows of `silu(gate) * up`, each `width` values.
+    fn swiglu(&self, gate_up: &[f32], width: usize) -> Vec<f32>;
+
+    /// Rotary position embedding, in place. `x` is `[t, n_heads * head_dim]`
+    /// and row `i` sits at absolute position `pos0 + i`. In every head, element
+    /// `j` pairs with element `j + head_dim / 2` ("rotate half", the layout
+    /// Hugging Face's Llama weights assume) and the pair is rotated by the angle
+    /// `position * inv_freq[j]`.
+    fn rope(&self, x: &mut [f32], pos0: usize, n_heads: usize, head_dim: usize, inv_freq: &[f32]);
 
     /// Softmax over the whole slice, in place.
     fn softmax(&self, x: &mut [f32]);

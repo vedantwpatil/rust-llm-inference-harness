@@ -142,16 +142,6 @@ impl<B: Backend> Gpt2<B> {
         note(&mut trace, "ln_f", &x);
         x
     }
-
-    /// Like `forward` from an empty cache, but returns every intermediate
-    /// activation, and logits for every position under "logits".
-    pub fn forward_trace(&self, ids: &[u32]) -> Trace {
-        let mut trace = Trace::new();
-        let x = self.run(ids, &mut self.new_cache(), Some(&mut trace));
-        let logits = self.backend.matmul(&x, ids.len(), &self.wte, None);
-        trace.insert("logits".into(), logits);
-        trace
-    }
 }
 
 impl<B: Backend> Model for Gpt2<B> {
@@ -165,90 +155,47 @@ impl<B: Backend> Model for Gpt2<B> {
         // Output projection is tied to the embedding table: logits = x @ wte^T.
         self.backend.matmul(&x[x.len() - w..], 1, &self.wte, None)
     }
+
+    fn forward_trace(&self, ids: &[u32]) -> Trace {
+        let mut trace = Trace::new();
+        let x = self.run(ids, &mut self.new_cache(), Some(&mut trace));
+        let logits = self.backend.matmul(&x, ids.len(), &self.wte, None);
+        trace.insert("logits".into(), logits);
+        trace
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::assert_close_to_scale;
     use crate::cpu::CpuBackend;
-    use crate::safetensors::load;
-    use std::path::Path;
+    use crate::reference::{self, Fixture};
 
     const EOS: u32 = 50256;
 
     // Both files are gitignored: tests skip on a fresh clone.
-    fn fixtures() -> Option<(Gpt2<CpuBackend>, Tensors)> {
-        let dir = Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/data/gpt2/"));
-        let (model, reference) = (
-            dir.join("model.safetensors"),
-            dir.join("reference.safetensors"),
-        );
-        if !model.exists() || !reference.exists() {
-            return None;
-        }
-        Some((
-            Gpt2::from_tensors(load(&model), CpuBackend::default()),
-            load(&reference),
-        ))
+    fn fixture() -> Option<Fixture<Gpt2<CpuBackend>>> {
+        Fixture::load("gpt2", |t| Gpt2::from_tensors(t, CpuBackend::default()))
     }
 
-    fn ids_of(reference: &Tensors, key: &str) -> Vec<u32> {
-        reference[key].1.iter().map(|&x| x as u32).collect()
-    }
-
-    // The done-when bar: every layer boundary against Hugging Face for the same ids.
     #[test]
     fn every_layer_matches_hugging_face() {
-        let Some((model, reference)) = fixtures() else {
-            return;
-        };
-        let ids = ids_of(&reference, "ids");
-        let trace = model.forward_trace(&ids);
-        let mut compared = 0;
-        for (name, (_, want)) in &reference {
-            if name == "ids" || name == "greedy_ids" {
-                continue;
-            }
-            let got = trace
-                .get(name)
-                .unwrap_or_else(|| panic!("no trace for {name}"));
-            assert_close_to_scale(got, want, 1e-4);
-            compared += 1;
+        if let Some(f) = fixture() {
+            reference::check_layers(&f, 12, 1e-4);
         }
-        // embed, 4 block-0 sub-layers, 12 blocks, ln_f, logits
-        assert_eq!(compared, 1 + 4 + 12 + 1 + 1);
     }
 
     #[test]
     fn greedy_matches_hugging_face_generate() {
-        let Some((model, reference)) = fixtures() else {
-            return;
-        };
-        let prompt = ids_of(&reference, "ids");
-        let want = ids_of(&reference, "greedy_ids");
-        let got = model.generate_greedy(&prompt, want.len() - prompt.len(), &[EOS]);
-        assert_eq!(got, want);
+        if let Some(f) = fixture() {
+            reference::check_greedy(&f, &[EOS]);
+        }
     }
 
-    // The cache is an optimization only: feeding tokens one at a time must give
-    // the logits a from-scratch pass over the same prefix gives.
     #[test]
     fn cached_decode_equals_recompute() {
-        let Some((model, reference)) = fixtures() else {
-            return;
-        };
-        let ids = ids_of(&reference, "greedy_ids");
-        let split = ids_of(&reference, "ids").len();
-        let mut cache = model.new_cache();
-        let mut cached = vec![model.forward(&ids[..split], &mut cache)];
-        for i in split..ids.len() {
-            cached.push(model.forward(&ids[i..=i], &mut cache));
-        }
-        assert_eq!(cache.len(), ids.len());
-        for (step, got) in cached.iter().enumerate() {
-            let want = model.forward(&ids[..split + step], &mut model.new_cache());
-            assert_close_to_scale(got, &want, 1e-5);
+        if let Some(f) = fixture() {
+            reference::check_cached_decode(&f, 1e-5);
         }
     }
 }
