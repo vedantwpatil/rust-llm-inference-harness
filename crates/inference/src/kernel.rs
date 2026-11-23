@@ -168,8 +168,12 @@ pub fn packed_index(rows: usize, r: usize, col: usize, k: usize) -> usize {
 ///
 /// `sdot` multiplies 16 int8 pairs into four int32 sums, four times the
 /// multiply-adds of an f32 `fmla`. Sums are int32 within one block, then
-/// converted and scaled into f32 accumulators, so a block costs one convert and
-/// one fused multiply-add per output beyond the dot products themselves.
+/// converted and scaled into f32 accumulators. With four rows the lanes of the
+/// rows' sums are added together first (`vpaddq`), so a block costs one convert
+/// and one fused multiply-add per token beyond the dot products themselves, and
+/// 16 accumulators fewer stay live: with an f32 accumulator per output, the
+/// 16 int32 sums, the 16 accumulators and the operands outnumber the 32
+/// registers and the compiler spills.
 #[allow(clippy::needless_range_loop)]
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 pub fn tile_q8<const R: usize, const T: usize>(
@@ -191,7 +195,10 @@ pub fn tile_q8<const R: usize, const T: usize>(
     // `t * k + b * Q8_BLOCK + s`, which ends at most at `full * Q8_BLOCK <= k`
     // inside row `t < T` of `x`, which the assert guarantees exists.
     unsafe {
-        let mut acc = [[vdupq_n_f32(0.0); T]; R];
+        // Four rows: one vector per token holds that token's four row totals.
+        // Otherwise one vector per output, summed across its lanes at the end.
+        let mut by_token = [vdupq_n_f32(0.0); T];
+        let mut by_output = [[vdupq_n_f32(0.0); T]; R];
         let (wp, xp) = (w.as_ptr(), x.as_ptr());
         for b in 0..full {
             let mut sums = [[vdupq_n_s32(0); T]; R];
@@ -207,14 +214,33 @@ pub fn tile_q8<const R: usize, const T: usize>(
             }
             for t in 0..T {
                 let scale = x_scales[t * blocks + b];
-                for r in 0..R {
-                    acc[r][t] = vfmaq_n_f32(acc[r][t], vcvtq_f32_s32(sums[r][t]), scale);
+                if R == 4 {
+                    // Add the lanes of the four rows' sums together first: one
+                    // convert and one multiply-add instead of four of each, and
+                    // 16 fewer live registers than an accumulator per output.
+                    let s: [int32x4_t; 4] = std::array::from_fn(|r| sums[r][t]);
+                    let (lo, hi) = (vpaddq_s32(s[0], s[1]), vpaddq_s32(s[2], s[3]));
+                    let totals = vcvtq_f32_s32(vpaddq_s32(lo, hi));
+                    by_token[t] = vfmaq_n_f32(by_token[t], totals, scale);
+                } else {
+                    for r in 0..R {
+                        let sum = vcvtq_f32_s32(sums[r][t]);
+                        by_output[r][t] = vfmaq_n_f32(by_output[r][t], sum, scale);
+                    }
                 }
             }
         }
-        for r in 0..R {
-            for t in 0..T {
-                out[r][t] = vaddvq_f32(acc[r][t]);
+        for t in 0..T {
+            if R == 4 {
+                let mut rows = [0.0f32; 4];
+                vst1q_f32(rows.as_mut_ptr(), by_token[t]);
+                for r in 0..R {
+                    out[r][t] = rows[r];
+                }
+            } else {
+                for r in 0..R {
+                    out[r][t] = vaddvq_f32(by_output[r][t]);
+                }
             }
         }
     }
