@@ -3,7 +3,7 @@
 //!
 //!     cargo run --release -p inference --example bench -- [gpt2 | qwen2.5-coder-0.5b] [--int8]
 //!
-//! `INFERENCE_THREADS=n` sets the model's thread count (default: min(cores, 8)).
+//! `INFERENCE_THREADS=n` sets the model's thread count (default: the performance cores).
 //! Needs the checkpoint in data/<name>/ (see crates/inference/scripts).
 
 mod common;
@@ -225,7 +225,7 @@ fn main() {
     );
     println!(
         "threads              {}",
-        std::env::var("INFERENCE_THREADS").unwrap_or("min(cores, 8)".into())
+        std::env::var("INFERENCE_THREADS").unwrap_or("performance cores".into())
     );
     println!(
         "read per decoded tok {:.0} MB weights + {:.1} MB KV cache",

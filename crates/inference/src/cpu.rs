@@ -16,7 +16,22 @@ impl CpuBackend {
     }
 }
 
+/// Threads a decoded token uses. Decode is bound by memory, which 8 threads
+/// already saturate: with 10 it is 5% slower and with all 14 (the efficiency
+/// cores too) 17%, since every region waits for its slowest thread. A prompt is
+/// bound by arithmetic and uses every thread: all 10 performance cores prefill
+/// 13% faster than 8. Measured on an M3 Max.
+const DECODE_THREADS: usize = 8;
+
 impl CpuBackend {
+    /// Threads a pass over `t` tokens runs its regions on.
+    fn threads(&self, t: usize) -> usize {
+        match t {
+            1 => self.pool.threads().min(DECODE_THREADS),
+            _ => self.pool.threads(),
+        }
+    }
+
     /// Elements per task when `len` of them are shared out, about four tasks per
     /// thread, but never fewer than `min`. A task has to outweigh the ~120 ns it
     /// costs to claim it (every thread's claim queues on one counter), so a task
@@ -79,18 +94,50 @@ impl CpuBackend {
 }
 
 impl Default for CpuBackend {
-    /// `INFERENCE_THREADS` if set, else one thread per core up to 8.
-    // shortcut: the cap of 8 is measured on an M3 Max (10 performance + 4
-    // efficiency cores), where all 14 threads decode slower than 8 because the
-    // efficiency cores straggle; read the performance-core count when another
-    // machine matters.
+    /// `INFERENCE_THREADS` if set, else one thread per performance core.
     fn default() -> Self {
         let threads = std::env::var("INFERENCE_THREADS")
             .ok()
             .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get().min(8)));
+            .or_else(performance_cores)
+            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
         Self::new(threads)
     }
+}
+
+/// Performance cores, if the OS says. Efficiency cores run at half the speed,
+/// and a region ends when its slowest thread does, so using them costs more
+/// than they add: all 14 cores of an M3 Max decode 17% slower than 8.
+// shortcut: macOS only; other systems get every core, which is wrong on
+// big.LITTLE Linux, read the cpu capacity files there when that machine matters.
+#[cfg(target_os = "macos")]
+fn performance_cores() -> Option<usize> {
+    unsafe extern "C" {
+        fn sysctlbyname(
+            name: *const std::ffi::c_char,
+            old: *mut std::ffi::c_void,
+            old_len: *mut usize,
+            new: *mut std::ffi::c_void,
+            new_len: usize,
+        ) -> i32;
+    }
+    let (mut n, mut len) = (0i32, size_of::<i32>());
+    // SAFETY: the name is NUL-terminated and `old` has room for `len` bytes.
+    let status = unsafe {
+        sysctlbyname(
+            c"hw.perflevel0.logicalcpu".as_ptr(),
+            (&raw mut n).cast(),
+            &raw mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (status == 0 && n > 0).then_some(n as usize)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn performance_cores() -> Option<usize> {
+    None
 }
 
 pub(crate) fn softmax_in_place(x: &mut [f32]) {
@@ -232,19 +279,21 @@ impl CpuBackend {
             // thread gets fewer than a few of them to balance the load.
             const TASK_BYTES: usize = 256 << 10;
             const TASKS_PER_THREAD: usize = 4;
-            let target = (row_bytes * n_out / (self.pool.threads() * TASKS_PER_THREAD))
-                .clamp(16 << 10, TASK_BYTES);
+            let threads = self.threads(t);
+            let target =
+                (row_bytes * n_out / (threads * TASKS_PER_THREAD)).clamp(16 << 10, TASK_BYTES);
             // Whole tiles of four rows, so `matmul_block` has no row tail.
             let rows = (target / row_bytes).max(4) / 4 * 4;
             let mut out = vec![0.0; n_out];
-            self.pool.for_each_chunk_mut(&mut out, rows, |c, slab| {
-                matmul_block(ops, c * rows, 1, slab);
-                if let Some(b) = bias {
-                    for (v, b) in slab.iter_mut().zip(&b[c * rows..]) {
-                        *v += b;
+            self.pool
+                .for_each_chunk_mut_width(threads, &mut out, rows, |c, slab| {
+                    matmul_block(ops, c * rows, 1, slab);
+                    if let Some(b) = bias {
+                        for (v, b) in slab.iter_mut().zip(&b[c * rows..]) {
+                            *v += b;
+                        }
                     }
-                }
-            });
+                });
             return out;
         }
 
@@ -447,11 +496,10 @@ impl Backend for CpuBackend {
         // Work items are (query, head) pairs, item `idx` owning chunk `idx` of
         // `out`. A task takes several when there are many (a whole query's
         // heads in prefill, where one item is ~2 us), one in decode.
-        let per_task = (t * n_heads)
-            .div_ceil(self.pool.threads() * 4)
-            .clamp(1, n_heads);
+        let threads = self.threads(t);
+        let per_task = (t * n_heads).div_ceil(threads * 4).clamp(1, n_heads);
         self.pool
-            .for_each_chunk_mut(&mut out, per_task * head_dim, |c, chunk| {
+            .for_each_chunk_mut_width(threads, &mut out, per_task * head_dim, |c, chunk| {
                 let mut scores = Vec::new();
                 for (j, o) in chunk.chunks_exact_mut(head_dim).enumerate() {
                     let idx = c * per_task + j;

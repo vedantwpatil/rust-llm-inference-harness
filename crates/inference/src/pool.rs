@@ -68,6 +68,9 @@ struct Shared {
     /// Mirror of `State::generation`, so a spinning worker can poll without
     /// taking the lock.
     generation: AtomicUsize,
+    /// Threads taking part in the current region, the caller included: workers
+    /// `1..width` join, the rest skip it without touching the lock.
+    width: AtomicUsize,
     sleeping: AtomicUsize,
     wake: Condvar,
     shutdown: AtomicBool,
@@ -89,14 +92,15 @@ impl Pool {
                 job: None,
             }),
             generation: AtomicUsize::new(0),
+            width: AtomicUsize::new(0),
             sleeping: AtomicUsize::new(0),
             wake: Condvar::new(),
             shutdown: AtomicBool::new(false),
         });
         let workers = (1..threads.max(1))
-            .map(|_| {
+            .map(|id| {
                 let shared = Arc::clone(&shared);
-                thread::spawn(move || worker(&shared))
+                thread::spawn(move || worker(&shared, id))
             })
             .collect();
         Self {
@@ -113,7 +117,14 @@ impl Pool {
     /// Calls `f(i)` for every `i` in `0..n_tasks`, spread over the pool, and
     /// returns when all calls are done. `f` must not call `run` on this pool.
     pub fn run(&self, n_tasks: usize, f: &(dyn Fn(usize) + Sync)) {
-        if n_tasks <= 1 || self.workers.is_empty() {
+        self.run_width(usize::MAX, n_tasks, f);
+    }
+
+    /// `run` on at most `width` threads, the caller included. A region that
+    /// streams memory gets no faster past the width that saturates it, and every
+    /// extra thread is one more that can be late to the barrier.
+    pub fn run_width(&self, width: usize, n_tasks: usize, f: &(dyn Fn(usize) + Sync)) {
+        if n_tasks <= 1 || width <= 1 || self.workers.is_empty() {
             (0..n_tasks).for_each(f);
             return;
         }
@@ -134,6 +145,7 @@ impl Pool {
             let mut state = self.shared.state.lock().unwrap();
             state.generation += 1;
             state.job = Some(Arc::clone(&job));
+            self.shared.width.store(width, Relaxed);
             self.shared.generation.store(state.generation, Release);
         }
         if self.shared.sleeping.load(Acquire) > 0 {
@@ -158,6 +170,17 @@ impl Pool {
         chunk: usize,
         f: impl Fn(usize, &mut [T]) + Sync,
     ) {
+        self.for_each_chunk_mut_width(usize::MAX, data, chunk, f);
+    }
+
+    /// `for_each_chunk_mut` on at most `width` threads, as `run_width`.
+    pub fn for_each_chunk_mut_width<T: Send>(
+        &self,
+        width: usize,
+        data: &mut [T],
+        chunk: usize,
+        f: impl Fn(usize, &mut [T]) + Sync,
+    ) {
         assert!(chunk > 0);
         struct Base<T>(*mut T);
         // SAFETY: each task gets a different, non-overlapping range of `data`.
@@ -172,7 +195,7 @@ impl Pool {
 
         let len = data.len();
         let base = Base(data.as_mut_ptr());
-        self.run(len.div_ceil(chunk), &|i| {
+        self.run_width(width, len.div_ceil(chunk), &|i| {
             let start = i * chunk;
             let n = chunk.min(len - start);
             // SAFETY: `start..start + n` lies inside `data`, no other task gets
@@ -184,7 +207,7 @@ impl Pool {
     }
 }
 
-fn worker(shared: &Shared) {
+fn worker(shared: &Shared, id: usize) {
     let mut seen = 0;
     loop {
         let spin_until = Instant::now() + SPIN;
@@ -207,6 +230,14 @@ fn worker(shared: &Shared) {
                 break;
             }
             std::hint::spin_loop();
+        }
+        // The width was stored before the generation this worker just saw, so a
+        // region that leaves it out costs it one load and no lock. (If a newer
+        // region has already replaced the width, this worker sits out that one
+        // too: only the parallelism of one region is lost, never a task.)
+        if id >= shared.width.load(Relaxed) {
+            seen = shared.generation.load(Acquire);
+            continue;
         }
         // A worker that missed a whole region just takes the newest job.
         let job = {
@@ -245,6 +276,22 @@ mod tests {
                 hits[i].fetch_add(1, Relaxed);
             });
             assert!(hits.iter().all(|h| h.load(Relaxed) == 1), "n = {n}");
+        }
+    }
+
+    #[test]
+    fn a_narrow_region_uses_at_most_its_width() {
+        let pool = Pool::new(6);
+        for width in [1, 2, 4, 6, 100] {
+            let threads = std::sync::Mutex::new(std::collections::HashSet::new());
+            // Tasks long enough that every thread allowed in gets a share.
+            pool.run_width(width, 64, &|_| {
+                threads.lock().unwrap().insert(thread::current().id());
+                thread::sleep(Duration::from_micros(200));
+            });
+            let used = threads.lock().unwrap().len();
+            assert!(used <= width.min(6), "width {width} used {used}");
+            assert!(used >= 1);
         }
     }
 
