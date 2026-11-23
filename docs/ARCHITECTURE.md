@@ -73,9 +73,9 @@ Encode and decode: pre-split, bytes to unicode, merge by rank; and back through 
 | ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `safetensors` | `load`: 8-byte header length, JSON header, raw bytes (F32 or BF16, widened to f32) into `Tensors`, a `HashMap` from tensor name to shape and flat row-major values. `take` removes one by name |
 | `backend`     | `Matrix { rows, cols, weights }` with `Weights::{F32, Q8}`, `AttnShape`, the `Backend` trait: `matmul`, `layernorm`, `rmsnorm`, `gelu`, `swiglu`, `rope`, `softmax`, `attention` |
-| `cpu`         | `CpuBackend { pool }`: the reference `Backend`. Parallel across a `Pool`, matmul through `kernel`                                                             |
+| `cpu`         | `CpuBackend { pool }`: the reference `Backend`. Parallel across a `Pool`, matmul through `kernel`; prefill uses every performance core and decode 8              |
 | `kernel`      | `tile<R, T, U>`: `R` weight rows against `T` activation rows, NEON on aarch64, scalar elsewhere. `dot` is the 1 by 1 case. `tile_q8<R, T>`: the int8 version, with `q8_scale` and `quantize_into` |
-| `pool`        | `Pool`: persistent fork-join thread pool. `run(n_tasks, f)`, `for_each_chunk_mut(slice, chunk, f)`                                                            |
+| `pool`        | `Pool`: persistent fork-join thread pool. `run(n_tasks, f)`, `for_each_chunk_mut(slice, chunk, f)`, and their `_width` forms that limit a region to its first threads |
 | `kv_cache`    | `KvCache`: per layer, keys and values as flat `[position][kv_dim]` vectors, plus the number of positions held                                                 |
 | `ops`         | `embed`, `add_in_place`, `argmax`, `split_columns`                                                                                                            |
 | `model`       | `Model` trait: `new_cache`, `forward`, `forward_trace`, `weight_bytes`, and the provided greedy loop `generate_each` / `generate_greedy`. `Trace`              |
@@ -130,7 +130,7 @@ Everything that differs between checkpoints is read from `config.json` or the te
 
 ### Int8
 
-`Weights::Q8 { values: Vec<i8>, scales: Vec<f32> }`: row `r` is `scales[r] * values[r * cols..]`, scale `max|row| / 127`. Norm weights and biases stay f32. `Llama::quantize` converts every weight matrix including the token embedding table; its lookup widens one row.
+`Weights::Q8 { values: Vec<i8>, scales: Vec<f32> }`: row `r` is `scales[r]` times its values, scale `max|row| / 127`. Values are stored in groups of four rows, block by block (`packed_index`, reached through `Matrix::q8_index`), so a tile that dots four rows with one activation row reads one contiguous run; rows after the last whole group stay plain. Norm weights and biases stay f32. `Llama::quantize` converts every weight matrix including the token embedding table; its lookup widens one row.
 
 A matmul against int8 weights rounds its activations to int8 too, once per call: one scale per `Q8_BLOCK` (128) values of a token, `max|block| / 127`. A scale per whole token let one outlier channel flatten the rest and cost 2.5 points of top-1 agreement with f32; per block confines it. `tile_q8` runs the integer dot products with `sdot` (16 multiply-adds per instruction, four times f32's rate), keeps the sums as int32 within a block, then converts and scales each block into f32 accumulators. `CpuBackend::matmul` hands `product` either operand pair (`F32Operands`, `Q8Operands`), so the row, token and parallel loops are written once.
 
@@ -140,7 +140,7 @@ Decode sizes its tasks in bytes (see [DEVELOPMENT_NOTES.md](DEVELOPMENT_NOTES.md
 
 `Pool::new(n)` starts `n - 1` workers; the calling thread is the n-th. A region publishes a job (task count, an atomic next-task counter, an atomic done counter) and every thread claims task indices until none are left. Workers spin on an atomic generation counter for a short window after each region, then sleep on a condition variable. A region with one task runs inline. One region runs at a time; a task panic is caught per task and re-raised by `run` after the region ends. Why this instead of rayon: [DEVELOPMENT_NOTES.md](DEVELOPMENT_NOTES.md#stage-2-gpt-2-on-the-cpu).
 
-`CpuBackend::matmul` gives each task 16 whole weight rows and every token's dot product with them, so a weight row is read from memory once however many tokens there are. The result is `[n_out][t]` and a second parallel pass transposes it to `[t][n_out]` and adds the bias; for one token the layout is already right, so the first pass adds the bias and the second is skipped. `attention` is one task per (query, head). `swiglu` and `gelu` run on the pool in flat chunks, `rope` and the norms are serial.
+`CpuBackend::matmul` gives each task 16 whole weight rows and every token's dot product with them, so a weight row is read from memory once however many tokens there are. Each task computes its rows as a small `[rows][t]` block and copies each token's strip, with the bias added, to its place in the result through `Strips`, an unsafe wrapper that hands out disjoint writes to one buffer. For one token the layout is already right, so a task writes the result and the bias directly, in tasks sized in bytes. `attention` is a few (query, head) pairs per task; `swiglu`, `gelu`, the norms, `rope` and the activation quantization run on the pool in chunks of whole rows or flat slices. `CpuBackend::chunk` sizes them so a task outweighs the cost of claiming it, and decode regions use `DECODE_THREADS` threads, prefill all of them.
 
 ### Verification fixtures
 

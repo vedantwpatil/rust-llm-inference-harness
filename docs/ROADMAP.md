@@ -259,12 +259,12 @@ GPT-2 (stage 2)                      Llama-style (stage 3)
 - **GQA (grouped-query attention):** several query heads share one key/value head. Llama 3.2 1B has 32 query heads and 8 KV heads, so KV cache 4x smaller than full multi-head attention.
 - **SwiGLU:** gated MLP, `down(silu(gate(x)) * up(x))`, three matrices instead of two.
 
-Quantization = separate pass over loaded weights. Weights stored as int8 with scales (per channel or per small group), activations stay f32, dequantization happens inside matvec. Decode bandwidth-bound, so 4x fewer bytes than f32 should give close to 4x faster decode.
+Quantization = separate pass over loaded weights. Weights stored as int8 with a scale per row, and the matmul rounds its activations to int8 too, one scale per block of 128 values, so the inner loop is an integer dot product. Decode bandwidth-bound, so 4x fewer bytes than f32 should give close to 4x faster decode.
 
 ```text
                ╔════════════╗    ╔═════════════════╗    ╔═════════════════╗
-               ║ Quantize   ║    ║ int8 W          ║    ║ matvec: dequant ║
-f32 weights ─▶ ║ (offline)  ║ ─▶ ║ + f32 scales    ║ ─▶ ║ inside the loop ║ ─▶ f32 out
+               ║ Quantize   ║    ║ int8 W          ║    ║ int8 dot (sdot) ║
+f32 weights ─▶ ║ (offline)  ║ ─▶ ║ + f32 scales    ║ ─▶ ║ x rounded to i8 ║ ─▶ f32 out
                ╚════════════╝    ╚═════════════════╝    ╚═════════════════╝
 ```
 
@@ -273,7 +273,7 @@ f32 weights ─▶ ║ (offline)  ║ ─▶ ║ + f32 scales    ║ ─▶ ║ 
 - Loader for new checkpoint format and `config.json` parsing into model config.
 - New `Backend` ops: `rmsnorm`, `rope`, SiLU/SwiGLU, GQA-aware attention.
 - **Tokenizer generalization:** Llama 3 and Qwen ship own byte-level BPE vocabulary (about 128K entries for Llama 3), pre-tokenizer pattern, special tokens. Stage 1 code must load these as data.
-- Weight-only int8 quantization, at load time or via offline converter.
+- int8 quantization of the weights at load time, and of the activations inside each matmul.
 
 **Done when**
 
