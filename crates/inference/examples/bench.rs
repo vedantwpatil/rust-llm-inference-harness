@@ -190,7 +190,7 @@ fn main() {
     let roofline = bandwidth / (weight_bytes as f64 + kv_bytes);
     println!(
         "model                {name}{}",
-        if int8 { " (int8 weights)" } else { "" }
+        if int8 { " (int8)" } else { "" }
     );
     println!(
         "threads              {}",

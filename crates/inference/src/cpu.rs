@@ -1,15 +1,6 @@
 use crate::backend::{AttnShape, Backend, Matrix, Weights};
-use crate::kernel::{dot, dot_q8, tile};
+use crate::kernel::{Q8_BLOCK, dot, q8_scale, quantize_into, tile, tile_q8};
 use crate::pool::Pool;
-use std::cell::RefCell;
-
-thread_local! {
-    // Widened int8 weight rows for the prefill path, one buffer per pool thread
-    // so a task never allocates: a 16-row slab of the widest matrix is ~300 KB,
-    // and a fresh allocation that size would page-fault on every call. The
-    // borrow is never re-entered because a pool task must not call `Pool::run`.
-    static WIDENED: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
-}
 
 /// Plain Rust on the CPU: NEON kernels, a spinning thread pool. The reference
 /// every other backend is compared against.
@@ -53,24 +44,85 @@ pub(crate) fn softmax_in_place(x: &mut [f32]) {
     }
 }
 
-/// `out[r * t + i] = w_row_r . x_row_i` for every row of `w` (`k` floats each)
-/// and every one of the `t` rows of `x`. Rows go four at a time, tokens four at
-/// a time when there are that many, so a loaded weight is reused across tokens.
-fn matmul_block(w: &[f32], x: &[f32], k: usize, t: usize, out: &mut [f32]) {
-    let rows = w.len() / k;
+/// The two sides of one matrix product, so `matmul_block` runs the same loops
+/// over f32 and over int8.
+trait Operands: Sync {
+    /// Weight rows `r..r + R` against tokens `i..i + T`: `out[a][b]` is the dot
+    /// product of weight row `r + a` with token `i + b`.
+    fn tile<const R: usize, const T: usize, const U: usize>(
+        &self,
+        r: usize,
+        i: usize,
+    ) -> [[f32; T]; R];
+}
+
+struct F32Operands<'a> {
+    w: &'a [f32],
+    x: &'a [f32],
+    k: usize,
+}
+
+impl Operands for F32Operands<'_> {
+    fn tile<const R: usize, const T: usize, const U: usize>(
+        &self,
+        r: usize,
+        i: usize,
+    ) -> [[f32; T]; R] {
+        let k = self.k;
+        tile::<R, T, U>(&self.w[r * k..], &self.x[i * k..], k)
+    }
+}
+
+/// Int8 weights with a scale per row against int8 activations with a scale per
+/// `Q8_BLOCK` values: the integer dot product, scaled per block by `tile_q8`
+/// and once per weight row here, is the f32 one.
+struct Q8Operands<'a> {
+    w: &'a [i8],
+    w_scales: &'a [f32],
+    x: &'a [i8],
+    x_scales: &'a [f32],
+    k: usize,
+}
+
+impl Operands for Q8Operands<'_> {
+    // `U` is f32's accumulator count per output; `tile_q8` has one per output.
+    fn tile<const R: usize, const T: usize, const _U: usize>(
+        &self,
+        r: usize,
+        i: usize,
+    ) -> [[f32; T]; R] {
+        let (k, blocks) = (self.k, self.k.div_ceil(Q8_BLOCK));
+        let mut out = tile_q8::<R, T>(
+            &self.w[r * k..],
+            &self.x[i * k..],
+            &self.x_scales[i * blocks..],
+            k,
+        );
+        for (a, row) in out.iter_mut().enumerate() {
+            row.iter_mut().for_each(|v| *v *= self.w_scales[r + a]);
+        }
+        out
+    }
+}
+
+/// Weight rows `first..first + rows` against every token: `out[r * t + i]` is
+/// row `first + r` dotted with token `i`. Rows go four at a time, tokens four
+/// at a time when there are that many, so a loaded weight is reused across
+/// tokens.
+fn matmul_block(ops: &impl Operands, first: usize, t: usize, out: &mut [f32]) {
+    let rows = out.len() / t;
     let mut r = 0;
     while r + 4 <= rows {
-        let w4 = &w[r * k..(r + 4) * k];
         let mut i = 0;
         while i + 4 <= t {
-            let tl = tile::<4, 4, 1>(w4, &x[i * k..], k);
+            let tl = ops.tile::<4, 4, 1>(first + r, i);
             for (a, row) in tl.iter().enumerate() {
                 out[(r + a) * t + i..][..4].copy_from_slice(row);
             }
             i += 4;
         }
         for i in i..t {
-            let tl = tile::<4, 1, 4>(w4, &x[i * k..], k);
+            let tl = ops.tile::<4, 1, 4>(first + r, i);
             for (a, row) in tl.iter().enumerate() {
                 out[(r + a) * t + i] = row[0];
             }
@@ -79,57 +131,49 @@ fn matmul_block(w: &[f32], x: &[f32], k: usize, t: usize, out: &mut [f32]) {
     }
     for r in r..rows {
         for i in 0..t {
-            out[r * t + i] = dot(&w[r * k..(r + 1) * k], &x[i * k..(i + 1) * k]);
+            out[r * t + i] = ops.tile::<1, 1, 4>(first + r, i)[0][0];
         }
     }
 }
 
-/// Rows `first..` of `w` (as many as `slab` has room for) against every token:
-/// `slab[r * t + i]` is row `first + r` dotted with token `i`.
-fn matmul_rows(w: &Matrix, first: usize, x: &[f32], t: usize, slab: &mut [f32]) {
-    let (n_in, rows) = (w.cols, slab.len() / t);
-    match &w.weights {
-        Weights::F32(data) => matmul_block(&data[first * n_in..][..rows * n_in], x, n_in, t, slab),
-        // One token: read each int8 row once, straight from memory.
-        Weights::Q8 { values, scales } if t == 1 => {
-            for (r, out) in slab.iter_mut().enumerate() {
-                *out = dot_q8(&values[(first + r) * n_in..][..n_in], x) * scales[first + r];
-            }
-        }
-        // Several tokens reuse each row, so widen it to f32 once and let the
-        // f32 tiles do the arithmetic.
-        Weights::Q8 { values, scales } => WIDENED.with_borrow_mut(|buf| {
-            buf.clear();
-            for r in first..first + rows {
-                let row = &values[r * n_in..][..n_in];
-                buf.extend(row.iter().map(|&q| q as f32 * scales[r]));
-            }
-            matmul_block(buf, x, n_in, t, slab);
-        }),
-    }
-}
-
-impl Backend for CpuBackend {
-    fn matmul(&self, x: &[f32], t: usize, w: &Matrix, bias: Option<&[f32]>) -> Vec<f32> {
-        let (n_out, n_in) = (w.rows, w.cols);
-        assert_eq!(x.len(), t * n_in);
+impl CpuBackend {
+    /// `ops` is a `[t][n_in]` activation matrix against `n_out` weight rows;
+    /// returns `[t][n_out]` with `bias` added.
+    fn product(
+        &self,
+        ops: &impl Operands,
+        t: usize,
+        n_out: usize,
+        row_bytes: usize,
+        bias: Option<&[f32]>,
+    ) -> Vec<f32> {
         if let Some(b) = bias {
             assert_eq!(b.len(), n_out);
         }
-        // Each task owns ROWS whole weight rows and every token's dot product
-        // with them, so a weight row is read from memory once however large t
-        // is.
-        const ROWS: usize = 16;
+        // Each task owns whole weight rows and every token's dot product with
+        // them, so a weight row is read from memory once however large t is.
+        const PREFILL_ROWS: usize = 16;
 
         // One token: `[n_out][1]` is already `[1][n_out]`, so the tasks write
         // the result and the bias directly. A second parallel region would do
         // nothing but cost a fork-join, and a decoded token has ~100 matmuls.
         if t == 1 {
+            // Decode is bound by memory, and a task that streams too few bytes
+            // never gets the memory system up to speed: 16 int8 rows (14 KB)
+            // reached 80 of the 126 GB/s the chip reads, 256 KB tasks reach
+            // about 105. So tasks are sized in bytes, but never so large that a
+            // thread gets fewer than a few of them to balance the load.
+            const TASK_BYTES: usize = 256 << 10;
+            const TASKS_PER_THREAD: usize = 4;
+            let target = (row_bytes * n_out / (self.pool.threads() * TASKS_PER_THREAD))
+                .clamp(16 << 10, TASK_BYTES);
+            // Whole tiles of four rows, so `matmul_block` has no row tail.
+            let rows = (target / row_bytes).max(4) / 4 * 4;
             let mut out = vec![0.0; n_out];
-            self.pool.for_each_chunk_mut(&mut out, ROWS, |c, slab| {
-                matmul_rows(w, c * ROWS, x, 1, slab);
+            self.pool.for_each_chunk_mut(&mut out, rows, |c, slab| {
+                matmul_block(ops, c * rows, 1, slab);
                 if let Some(b) = bias {
-                    for (v, b) in slab.iter_mut().zip(&b[c * ROWS..]) {
+                    for (v, b) in slab.iter_mut().zip(&b[c * rows..]) {
                         *v += b;
                     }
                 }
@@ -140,8 +184,8 @@ impl Backend for CpuBackend {
         // Several tokens: the result is `[n_out][t]`; transposed below.
         let mut by_out = vec![0.0; n_out * t];
         self.pool
-            .for_each_chunk_mut(&mut by_out, ROWS * t, |c, slab| {
-                matmul_rows(w, c * ROWS, x, t, slab)
+            .for_each_chunk_mut(&mut by_out, PREFILL_ROWS * t, |c, slab| {
+                matmul_block(ops, c * PREFILL_ROWS, t, slab)
             });
 
         // Transpose to `[t][n_out]` and add the bias. A task owns a few whole
@@ -159,6 +203,49 @@ impl Backend for CpuBackend {
                 }
             });
         out
+    }
+}
+
+impl Backend for CpuBackend {
+    fn matmul(&self, x: &[f32], t: usize, w: &Matrix, bias: Option<&[f32]>) -> Vec<f32> {
+        let (n_out, k) = (w.rows, w.cols);
+        assert_eq!(x.len(), t * k);
+        match &w.weights {
+            Weights::F32(data) => self.product(
+                &F32Operands { w: data, x, k },
+                t,
+                n_out,
+                w.bytes() / n_out,
+                bias,
+            ),
+            Weights::Q8 { values, scales } => {
+                // Quantize each token's activations once for the whole product.
+                // The scales come first (cheap, serial); the rounding, which is
+                // most of the work, runs in parallel.
+                let blocks = k.div_ceil(Q8_BLOCK);
+                let x_scales: Vec<f32> = x
+                    .chunks_exact(k)
+                    .flat_map(|row| row.chunks(Q8_BLOCK).map(q8_scale))
+                    .collect();
+                let mut xq = vec![0i8; x.len()];
+                self.pool.for_each_chunk_mut(&mut xq, k, |i, out| {
+                    let row = out
+                        .chunks_mut(Q8_BLOCK)
+                        .zip(x[i * k..][..k].chunks(Q8_BLOCK));
+                    for (b, (out, vals)) in row.enumerate() {
+                        quantize_into(vals, x_scales[i * blocks + b], out);
+                    }
+                });
+                let ops = Q8Operands {
+                    w: values,
+                    w_scales: scales,
+                    x: &xq,
+                    x_scales: &x_scales,
+                    k,
+                };
+                self.product(&ops, t, n_out, w.bytes() / n_out, bias)
+            }
+        }
     }
 
     fn layernorm(&self, x: &[f32], gamma: &[f32], beta: &[f32], eps: f32) -> Vec<f32> {
@@ -308,7 +395,7 @@ mod tests {
 
     #[test]
     fn matmul_matches_naive_loops() {
-        // sizes hit: a k tail, a partial ROWS chunk, rows % 4 != 0, t % 4 != 0, t >= 4
+        // sizes hit: a k tail, a partial chunk of rows, rows % 4 != 0, t % 4 != 0, t >= 4
         for (t, n_in, n_out) in [
             (1, 19, 37),
             (5, 19, 37),
@@ -351,24 +438,36 @@ mod tests {
         assert_close(&got, &[-1., 3., -1., 3.], 1e-6, 0.0);
     }
 
+    // The int8 product is exact integer arithmetic around the rounding, so it
+    // must equal the f32 product of the same rounded values: a wrong block
+    // boundary, scale index or tail shows up here, not as a vague accuracy loss.
     #[test]
-    fn int8_matmul_equals_f32_matmul_on_the_dequantized_weights() {
-        let (n_out, n_in) = (37, 100);
+    fn int8_matmul_equals_f32_matmul_on_the_dequantized_operands() {
+        // two whole blocks and a partial one
+        let (n_out, n_in) = (37, 2 * Q8_BLOCK + 44);
         let mut q = Matrix::new(n_out, n_in, data(n_out * n_in, 4));
         q.quantize();
         let Weights::Q8 { values, scales } = &q.weights else {
             unreachable!()
         };
-        let widened: Vec<f32> = (0..n_out * n_in)
+        let dequantized_w: Vec<f32> = (0..n_out * n_in)
             .map(|i| values[i] as f32 * scales[i / n_in])
             .collect();
-        let widened = Matrix::new(n_out, n_in, widened);
+        let dequantized_w = Matrix::new(n_out, n_in, dequantized_w);
         let bias = data(n_out, 6);
-        // one token takes the direct kernel; 2 and 9 tokens take the widened path
+        // 1 token takes the decode path; 2 and 9 the prefill one, with a token tail
         for t in [1, 2, 9] {
             let x = data(t * n_in, 8);
+            let mut dequantized_x = Vec::new();
+            // blocks never straddle two tokens: each token ends in a partial one
+            for block in x.chunks_exact(n_in).flat_map(|row| row.chunks(Q8_BLOCK)) {
+                let scale = q8_scale(block);
+                let mut q = vec![0i8; block.len()];
+                quantize_into(block, scale, &mut q);
+                dequantized_x.extend(q.iter().map(|&v| v as f32 * scale));
+            }
             let got = cpu().matmul(&x, t, &q, Some(&bias));
-            let want = cpu().matmul(&x, t, &widened, Some(&bias));
+            let want = cpu().matmul(&dequantized_x, t, &dequantized_w, Some(&bias));
             assert_close(&got, &want, 1e-5, 1e-4);
         }
     }

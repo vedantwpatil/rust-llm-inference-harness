@@ -1,6 +1,6 @@
-//! How much int8 weights change a model: on one text, the model sees each
-//! token's prefix and predicts the next, in f32 and then with its weights
-//! quantized. Reports next-token agreement between the two and perplexity.
+//! How much int8 changes a model: on one text, the model sees each token's
+//! prefix and predicts the next, in f32 and then with its weights (and, in
+//! every matmul, its activations) quantized. Reports next-token agreement between the two and perplexity.
 //!
 //!     cargo run --release -p inference --example eval_int8 -- [text file] [tokens]
 //!

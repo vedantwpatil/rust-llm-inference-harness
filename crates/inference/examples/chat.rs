@@ -65,6 +65,6 @@ fn main() {
         "\n[{} prompt tokens, first token after {:.0} ms; {generated} tokens generated, {rate} tok/s after the first{}]",
         ids.len(),
         first.as_secs_f64() * 1e3,
-        if int8 { ", int8 weights" } else { "" }
+        if int8 { ", int8" } else { "" }
     );
 }

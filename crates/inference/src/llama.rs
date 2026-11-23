@@ -118,8 +118,9 @@ impl<B: Backend> Llama<B> {
     }
 
     /// Stores every weight matrix as int8 with one scale per row, the token
-    /// embedding table (also the output projection when tied) included. Norm
-    /// weights and biases stay f32: they are tiny and every output depends on them.
+    /// embedding table (also the output projection when tied) included; every
+    /// matmul then rounds its activations to int8 as well. Norm weights and
+    /// biases stay f32: they are tiny and every output depends on them.
     pub fn quantize(&mut self) {
         let layers = self.layers.iter_mut().flat_map(Layer::matrices_mut);
         for m in layers.chain([&mut self.embed]).chain(self.lm_head.as_mut()) {

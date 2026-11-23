@@ -1,3 +1,5 @@
+use crate::kernel::{q8_scale, quantize_into};
+
 /// A weight matrix stored `[rows = outputs, cols = inputs]`, row-major. Output
 /// `o` of `x @ W^T` is the dot product of `x` with the contiguous run of row
 /// `o`, which is what a matrix-vector kernel wants to stream. Hugging Face's
@@ -11,9 +13,10 @@ pub struct Matrix {
 /// How a matrix's values are stored.
 pub enum Weights {
     F32(Vec<f32>),
-    /// Weight-only int8: row `r` is `scales[r] * values[r * cols..][..cols]`.
-    /// Each row has its own scale, so one large value only costs the precision
-    /// of its own row. Activations stay f32.
+    /// Int8: row `r` is `scales[r] * values[r * cols..][..cols]`. Each row has
+    /// its own scale, so one large value only costs the precision of its own
+    /// row. A matmul against these rounds its activations to int8 too, one scale
+    /// per token.
     Q8 {
         values: Vec<i8>,
         scales: Vec<f32>,
@@ -45,13 +48,14 @@ impl Matrix {
         let Weights::F32(data) = &self.weights else {
             return;
         };
-        let mut values = Vec::with_capacity(data.len());
+        let mut values = vec![0i8; data.len()];
         let mut scales = Vec::with_capacity(self.rows);
-        for row in data.chunks_exact(self.cols) {
-            let max = row.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-            // An all-zero row has nothing to scale; 1 keeps the division finite.
-            let scale = if max == 0.0 { 1.0 } else { max / 127.0 };
-            values.extend(row.iter().map(|v| (v / scale).round() as i8));
+        for (row, out) in data
+            .chunks_exact(self.cols)
+            .zip(values.chunks_exact_mut(self.cols))
+        {
+            let scale = q8_scale(row);
+            quantize_into(row, scale, out);
             scales.push(scale);
         }
         self.weights = Weights::Q8 { values, scales };

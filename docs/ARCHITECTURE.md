@@ -6,7 +6,7 @@ Cargo workspace, one crate per layer:
 
 - `crates/tokenizer`: the library.
 - `crates/tokenizer-cli`: demo binary (`main.rs`). `take_input` reads the prompt from a positional arg (no `clap`). Prints compression for word, char, byte, trained BPE and GPT-2 BPE.
-- `crates/inference`: the model side. Safetensors loader, a `Backend` trait with a CPU implementation, GPT-2 and Llama-style (Llama, Qwen2) forward passes with a KV cache, weight-only int8. Modules in [Inference modules](#inference-modules).
+- `crates/inference`: the model side. Safetensors loader, a `Backend` trait with a CPU implementation, GPT-2 and Llama-style (Llama, Qwen2) forward passes with a KV cache, int8. Modules in [Inference modules](#inference-modules).
 
 ## Tokenizer modules
 
@@ -74,7 +74,7 @@ Encode and decode: pre-split, bytes to unicode, merge by rank; and back through 
 | `safetensors` | `load`: 8-byte header length, JSON header, raw bytes (F32 or BF16, widened to f32) into `Tensors`, a `HashMap` from tensor name to shape and flat row-major values. `take` removes one by name |
 | `backend`     | `Matrix { rows, cols, weights }` with `Weights::{F32, Q8}`, `AttnShape`, the `Backend` trait: `matmul`, `layernorm`, `rmsnorm`, `gelu`, `swiglu`, `rope`, `softmax`, `attention` |
 | `cpu`         | `CpuBackend { pool }`: the reference `Backend`. Parallel across a `Pool`, matmul through `kernel`                                                             |
-| `kernel`      | `tile<R, T, U>`: `R` weight rows against `T` activation rows, NEON on aarch64, scalar elsewhere. `dot` is the 1 by 1 case. `dot_q8`: int8 row against f32 row    |
+| `kernel`      | `tile<R, T, U>`: `R` weight rows against `T` activation rows, NEON on aarch64, scalar elsewhere. `dot` is the 1 by 1 case. `tile_q8<R, T>`: the int8 version, with `q8_scale` and `quantize_into` |
 | `pool`        | `Pool`: persistent fork-join thread pool. `run(n_tasks, f)`, `for_each_chunk_mut(slice, chunk, f)`                                                            |
 | `kv_cache`    | `KvCache`: per layer, keys and values as flat `[position][kv_dim]` vectors, plus the number of positions held                                                 |
 | `ops`         | `embed`, `add_in_place`, `argmax`, `split_columns`                                                                                                            |
@@ -128,11 +128,13 @@ cache.advance(t) ─▶ rmsnorm ─▶ last row @ (lm_head or embedding)^T ─�
 
 Everything that differs between checkpoints is read from `config.json` or the tensor list: sizes, `head_dim`, the rope base and scaling, tied embeddings, and whether the query, key and value projections have biases (Qwen2 yes, Llama no: the loader checks for the tensor).
 
-### Weight-only int8
+### Int8
 
-`Weights::Q8 { values: Vec<i8>, scales: Vec<f32> }`: row `r` is `scales[r] * values[r * cols..]`, scale `max|row| / 127`. Norm weights and biases stay f32. `Llama::quantize` converts every weight matrix including the token embedding table; its lookup widens one row. Activations stay f32 throughout.
+`Weights::Q8 { values: Vec<i8>, scales: Vec<f32> }`: row `r` is `scales[r] * values[r * cols..]`, scale `max|row| / 127`. Norm weights and biases stay f32. `Llama::quantize` converts every weight matrix including the token embedding table; its lookup widens one row.
 
-`CpuBackend::matmul` picks the path by token count. One token (decode) runs `dot_q8` straight over the int8 rows. Several tokens widen each task's 16-row slab to f32 in a per-thread scratch buffer and run the f32 `tile` kernels, because prefill reuses each weight across tokens and is compute-bound, where reading fewer bytes does not help.
+A matmul against int8 weights rounds its activations to int8 too, once per call: one scale per `Q8_BLOCK` (128) values of a token, `max|block| / 127`. A scale per whole token let one outlier channel flatten the rest and cost 2.5 points of top-1 agreement with f32; per block confines it. `tile_q8` runs the integer dot products with `sdot` (16 multiply-adds per instruction, four times f32's rate), keeps the sums as int32 within a block, then converts and scales each block into f32 accumulators. `CpuBackend::matmul` hands `product` either operand pair (`F32Operands`, `Q8Operands`), so the row, token and parallel loops are written once.
+
+Decode sizes its tasks in bytes (see [DEVELOPMENT_NOTES.md](DEVELOPMENT_NOTES.md)), not rows.
 
 ### Parallelism
 

@@ -99,52 +99,122 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
     tile::<1, 1, 4>(a, b, a.len())[0][0]
 }
 
-/// Dot product of int8 weights with f32 activations, not yet multiplied by the
-/// row's scale. Decode is memory-bound, so the point is to read a quarter of the
-/// bytes `dot` reads; the widening to f32 happens in registers, 16 weights per
-/// step, into four accumulators so the fused multiply-adds overlap.
-#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-pub fn dot_q8(w: &[i8], x: &[f32]) -> f32 {
-    use std::arch::aarch64::*;
-    assert_eq!(w.len(), x.len());
-    let main = w.len() / 16 * 16;
-    let mut sum;
-    // SAFETY: the cfg gate guarantees NEON. Each step loads 16 bytes
-    // from `w` and 4 floats four times from `x`, all starting below `main`
-    // and ending at most at `main <= len`, which the assert ties to both slices.
-    unsafe {
-        let mut acc = [vdupq_n_f32(0.0); 4];
-        let (wp, xp) = (w.as_ptr(), x.as_ptr());
-        for k in (0..main).step_by(16) {
-            let q = vld1q_s8(wp.add(k));
-            let (lo, hi) = (vmovl_s8(vget_low_s8(q)), vmovl_high_s8(q));
-            let widened = [
-                vmovl_s16(vget_low_s16(lo)),
-                vmovl_high_s16(lo),
-                vmovl_s16(vget_low_s16(hi)),
-                vmovl_high_s16(hi),
-            ];
-            for (u, v) in widened.into_iter().enumerate() {
-                acc[u] = vfmaq_f32(acc[u], vcvtq_f32_s32(v), vld1q_f32(xp.add(k + 4 * u)));
-            }
-        }
-        sum = vaddvq_f32(vaddq_f32(
-            vaddq_f32(acc[0], acc[1]),
-            vaddq_f32(acc[2], acc[3]),
-        ));
-    }
-    for k in main..w.len() {
-        sum += w[k] as f32 * x[k];
-    }
-    sum
+/// Activation values that share one int8 scale. A scale per whole token lets
+/// one outlier channel crush the precision of every other value in it (top-1
+/// agreement with f32 drops 2.5 points on Qwen); a scale per block confines the
+/// damage. Longer blocks mean fewer conversions per dot product, shorter ones
+/// a better fit to the values.
+pub const Q8_BLOCK: usize = 128;
+
+/// The scale that maps the largest magnitude in `row` to 127. An all-zero row
+/// has nothing to scale; 1 keeps the division finite.
+pub fn q8_scale(row: &[f32]) -> f32 {
+    let max = row.iter().fold(0.0f32, |m, v| m.max(v.abs()));
+    if max == 0.0 { 1.0 } else { max / 127.0 }
 }
 
-// shortcut: scalar loop off aarch64, like `tile`; write an AVX2 version when a
+/// `row` divided by `scale` and rounded to int8, written to `out`.
+pub fn quantize_into(row: &[f32], scale: f32, out: &mut [i8]) {
+    let inv = 1.0 / scale;
+    for (q, v) in out.iter_mut().zip(row) {
+        *q = (v * inv).round() as i8;
+    }
+}
+
+/// `tile` for int8 rows `w` (`k` values each) against int8 activation rows `x`,
+/// where `x_scales` holds `k.div_ceil(Q8_BLOCK)` scales per row. Returns the
+/// dot products of the dequantized activations with the *unscaled* weights:
+/// the caller multiplies each weight row's own scale in.
+///
+/// `sdot` multiplies 16 int8 pairs into four int32 sums, four times the
+/// multiply-adds of an f32 `fmla`. Sums are int32 within one block, then
+/// converted and scaled into f32 accumulators, so a block costs one convert and
+/// one fused multiply-add per output beyond the dot products themselves.
+#[allow(clippy::needless_range_loop)]
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+pub fn tile_q8<const R: usize, const T: usize>(
+    w: &[i8],
+    x: &[i8],
+    x_scales: &[f32],
+    k: usize,
+) -> [[f32; T]; R] {
+    use std::arch::aarch64::*;
+    let blocks = k.div_ceil(Q8_BLOCK);
+    assert!(k <= w.len() / R && k <= x.len() / T && blocks <= x_scales.len() / T);
+    let full = k / Q8_BLOCK;
+    let mut out = [[0.0f32; T]; R];
+
+    // SAFETY: the cfg gate guarantees NEON. Every load reads 16 bytes at
+    // `row * k + b * Q8_BLOCK + s` with `b < full` and `s + 16 <= Q8_BLOCK`, so
+    // it ends at most at `full * Q8_BLOCK <= k` inside row `row < R` (or `< T`)
+    // of `w` (or `x`), and the assert above guarantees those rows exist.
+    unsafe {
+        let mut acc = [[vdupq_n_f32(0.0); T]; R];
+        let (wp, xp) = (w.as_ptr(), x.as_ptr());
+        for b in 0..full {
+            let mut sums = [[vdupq_n_s32(0); T]; R];
+            for s in (0..Q8_BLOCK).step_by(16) {
+                let at = b * Q8_BLOCK + s;
+                let xv: [int8x16_t; T] = std::array::from_fn(|t| vld1q_s8(xp.add(t * k + at)));
+                for r in 0..R {
+                    let wv = vld1q_s8(wp.add(r * k + at));
+                    for t in 0..T {
+                        sums[r][t] = vdotq_s32(sums[r][t], wv, xv[t]);
+                    }
+                }
+            }
+            for t in 0..T {
+                let scale = x_scales[t * blocks + b];
+                for r in 0..R {
+                    acc[r][t] = vfmaq_n_f32(acc[r][t], vcvtq_f32_s32(sums[r][t]), scale);
+                }
+            }
+        }
+        for r in 0..R {
+            for t in 0..T {
+                out[r][t] = vaddvq_f32(acc[r][t]);
+            }
+        }
+    }
+
+    if full < blocks {
+        for r in 0..R {
+            for t in 0..T {
+                let at = full * Q8_BLOCK;
+                let sum = dot_i8(&w[r * k + at..][..k - at], &x[t * k + at..][..k - at]);
+                out[r][t] += sum as f32 * x_scales[t * blocks + full];
+            }
+        }
+    }
+    out
+}
+
+// shortcut: scalar loops off aarch64, like `tile`; write an AVX2 version when a
 // second target matters.
 #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
-pub fn dot_q8(w: &[i8], x: &[f32]) -> f32 {
-    assert_eq!(w.len(), x.len());
-    w.iter().zip(x).map(|(&q, v)| q as f32 * v).sum()
+pub fn tile_q8<const R: usize, const T: usize>(
+    w: &[i8],
+    x: &[i8],
+    x_scales: &[f32],
+    k: usize,
+) -> [[f32; T]; R] {
+    let blocks = k.div_ceil(Q8_BLOCK);
+    assert!(k <= w.len() / R && k <= x.len() / T && blocks <= x_scales.len() / T);
+    let mut out = [[0.0f32; T]; R];
+    for r in 0..R {
+        for t in 0..T {
+            for b in 0..blocks {
+                let (from, to) = (b * Q8_BLOCK, ((b + 1) * Q8_BLOCK).min(k));
+                let sum = dot_i8(&w[r * k + from..r * k + to], &x[t * k + from..t * k + to]);
+                out[r][t] += sum as f32 * x_scales[t * blocks + b];
+            }
+        }
+    }
+    out
+}
+
+fn dot_i8(w: &[i8], x: &[i8]) -> i32 {
+    w.iter().zip(x).map(|(&a, &b)| a as i32 * b as i32).sum()
 }
 
 #[cfg(test)]
@@ -185,14 +255,47 @@ mod tests {
     }
 
     #[test]
-    fn dot_q8_matches_widening_first() {
-        // lengths: shorter than one step, a tail after whole steps, exact multiples
-        for k in [0, 3, 15, 16, 17, 100, 896] {
-            let w: Vec<i8> = data(k, 3).iter().map(|v| (v * 127.0) as i8).collect();
-            let x = data(k, 4);
-            let want: f64 = w.iter().zip(&x).map(|(&q, &v)| q as f64 * v as f64).sum();
-            assert_close(&[dot_q8(&w, &x)], &[want as f32], 1e-5, 1e-4);
+    fn int8_tiles_match_naive() {
+        // k covers: shorter than a block, a partial block after whole ones, exact multiples
+        for k in [0, 3, 16, 100, Q8_BLOCK, Q8_BLOCK + 3, 3 * Q8_BLOCK, 896] {
+            let blocks = k.div_ceil(Q8_BLOCK);
+            let w: Vec<i8> = data(4 * k, 3).iter().map(|v| (v * 127.0) as i8).collect();
+            let x: Vec<i8> = data(4 * k, 4).iter().map(|v| (v * 127.0) as i8).collect();
+            let xs: Vec<f32> = data(4 * blocks, 5).iter().map(|v| v.abs() + 0.5).collect();
+            let naive = |r: usize, t: usize| -> f32 {
+                (0..k)
+                    .map(|i| {
+                        let scale = xs[t * blocks + i / Q8_BLOCK];
+                        w[r * k + i] as f64 * x[t * k + i] as f64 * scale as f64
+                    })
+                    .sum::<f64>() as f32
+            };
+            let (a, b) = (
+                tile_q8::<4, 4>(&w, &x, &xs, k),
+                tile_q8::<4, 1>(&w, &x, &xs, k),
+            );
+            for r in 0..4 {
+                for (t, got) in a[r].iter().enumerate() {
+                    assert_close(&[*got], &[naive(r, t)], 1e-4, 1e-4);
+                }
+                assert_close(&[b[r][0]], &[naive(r, 0)], 1e-4, 1e-4);
+            }
         }
+    }
+
+    #[test]
+    fn quantize_keeps_the_max_exact_and_zero_rows_finite() {
+        let row = data(70, 5);
+        let scale = q8_scale(&row);
+        let mut q = vec![0i8; row.len()];
+        quantize_into(&row, scale, &mut q);
+        let big = row.iter().map(|v| v.abs()).fold(0.0, f32::max);
+        let at = row.iter().position(|v| v.abs() == big).unwrap();
+        assert_eq!(q[at].unsigned_abs(), 127);
+        for (&q, &v) in q.iter().zip(&row) {
+            assert!((q as f32 * scale - v).abs() <= 0.5 * scale * (1.0 + 1e-5));
+        }
+        assert_eq!(q8_scale(&[0.0; 8]), 1.0);
     }
 
     #[test]
