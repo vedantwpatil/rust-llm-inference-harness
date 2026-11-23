@@ -233,7 +233,10 @@ fn encode_ids_join_back_to_symbols() {
     let tok = toy_tokenizer();
     for text in ["the tokenizer", " caf\u{e9} \u{1F600}", "x", ""] {
         let ids = tok.encode(text);
-        let joined: String = ids.iter().map(|&id| tok.vocab[id as usize].as_str()).collect();
+        let joined: String = ids
+            .iter()
+            .map(|&id| tok.vocab[id as usize].as_str())
+            .collect();
         assert_eq!(joined, bytes_to_symbols(&tok.byte_symbols, text).concat());
     }
 }
@@ -529,6 +532,49 @@ fn gpt2_encode_matches_tiktoken() {
 fn gpt2_decode_matches_tiktoken() {
     let tok = gpt2();
     for &(text, ids) in ORACLE {
+        assert_eq!(
+            tok.decode(ids).unwrap(),
+            text,
+            "decode mismatch for {text:?}"
+        );
+    }
+}
+
+// The checkpoint is gitignored (crates/inference/scripts/fetch_model.py), so
+// these tests skip on a fresh clone. Expected ids come from Hugging Face's
+// `tokenizers`, see scripts/gen_qwen_oracle.py.
+fn qwen() -> Option<Tokenizer> {
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../inference/data/qwen2.5-coder-0.5b/tokenizer.json"
+    );
+    let json = std::fs::read_to_string(path).ok()?;
+    Some(Tokenizer::from_tokenizer_json(&json))
+}
+
+const QWEN_ORACLE: &[(&str, &[u32])] = include!("../data/qwen2.5-coder/oracle_cases.in");
+
+#[test]
+fn qwen_layout_matches_the_file() {
+    let Some(tok) = qwen() else { return };
+    // 151643 vocabulary entries, then 22 added tokens at the end
+    assert_eq!(tok.vocab.len(), 151665);
+    assert_eq!(tok.vocab_ids["<|im_end|>"], 151645);
+    assert_eq!(tok.vocab_ids["\u{120}"], 220);
+}
+
+#[test]
+fn qwen_encode_matches_huggingface() {
+    let Some(tok) = qwen() else { return };
+    for &(text, ids) in QWEN_ORACLE {
+        assert_eq!(tok.encode(text), ids, "encode mismatch for {text:?}");
+    }
+}
+
+#[test]
+fn qwen_decode_matches_huggingface() {
+    let Some(tok) = qwen() else { return };
+    for &(text, ids) in QWEN_ORACLE {
         assert_eq!(
             tok.decode(ids).unwrap(),
             text,

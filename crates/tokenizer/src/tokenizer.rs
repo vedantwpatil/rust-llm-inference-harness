@@ -84,6 +84,61 @@ impl Tokenizer {
         )
     }
 
+    /// Builds a tokenizer from a Hugging Face `tokenizer.json` with a byte-level
+    /// BPE model (Llama 3, Qwen): the vocabulary, merges, split pattern and
+    /// added tokens are all read as data. Every added token is a special here,
+    /// as in Hugging Face, which cuts them out of raw text whether or not they
+    /// are flagged special.
+    // shortcut: the file's normalizer is ignored. Qwen's is NFC, so text with
+    // decomposed accents encodes differently from Hugging Face; needs Unicode
+    // normalization tables.
+    pub fn from_tokenizer_json(json: &str) -> Self {
+        let doc: serde_json::Value = serde_json::from_str(json).unwrap();
+        let model = &doc["model"];
+        assert_eq!(model["type"], "BPE");
+
+        let specials: Vec<(String, u32)> = doc["added_tokens"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|t| {
+                let id = u32::try_from(t["id"].as_u64().unwrap()).unwrap();
+                (t["content"].as_str().unwrap().to_string(), id)
+            })
+            .collect();
+        let entries: Vec<(&str, usize)> = model["vocab"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(token, id)| (token.as_str(), id.as_u64().unwrap() as usize))
+            .chain(specials.iter().map(|(t, id)| (t.as_str(), *id as usize)))
+            .collect();
+        let mut vocab = vec![String::new(); entries.iter().map(|&(_, id)| id + 1).max().unwrap()];
+        for (token, id) in entries {
+            vocab[id] = token.to_string();
+        }
+        // A hole would map the empty string to an id and decode to nothing.
+        assert!(
+            vocab.iter().all(|t| !t.is_empty()),
+            "ids are not contiguous"
+        );
+
+        let merges = model["merges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| match m.as_str() {
+                Some(pair) => pair.split_once(' ').unwrap(),
+                None => (m[0].as_str().unwrap(), m[1].as_str().unwrap()),
+            })
+            .map(|(a, b)| (a.to_string(), b.to_string()))
+            .collect();
+
+        // A plain ByteLevel pre-tokenizer (GPT-2's file) has no Split to read.
+        let pattern = split_pattern(&doc["pre_tokenizer"]).unwrap_or(GPT2_PATTERN);
+        Self::new(vocab, merges, pattern, specials)
+    }
+
     // Special tokens are cut out of the text first and emitted as their own id,
     // so they are never pre-tokenized or merged. Text between them is encoded
     // normally.
@@ -160,5 +215,17 @@ impl Tokenizer {
         for chars in self.vocab[id as usize].chars() {
             out.push(self.char_to_byte[&chars]);
         }
+    }
+}
+
+/// The regex of the first `Split` pre-tokenizer, looking inside a `Sequence`.
+fn split_pattern(pre: &serde_json::Value) -> Option<&str> {
+    match pre["type"].as_str()? {
+        "Split" => pre["pattern"]["Regex"].as_str(),
+        "Sequence" => pre["pretokenizers"]
+            .as_array()?
+            .iter()
+            .find_map(split_pattern),
+        _ => None,
     }
 }
