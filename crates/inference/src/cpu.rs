@@ -93,13 +93,20 @@ impl Backend for CpuBackend {
                 matmul_block(&w.data[c * ROWS * n_in..][..rows * n_in], x, n_in, t, slab);
             });
 
+        // Transpose to `[t][n_out]` and add the bias. A task owns a few whole
+        // token rows of `out`, so the writes stay disjoint.
+        const TOKENS: usize = 4;
         let mut out = vec![0.0; t * n_out];
-        for o in 0..n_out {
-            let b = bias.map_or(0.0, |b| b[o]);
-            for i in 0..t {
-                out[i * n_out + o] = by_out[o * t + i] + b;
-            }
-        }
+        self.pool
+            .for_each_chunk_mut(&mut out, TOKENS * n_out, |c, rows| {
+                let first = c * TOKENS;
+                for o in 0..n_out {
+                    let b = bias.map_or(0.0, |b| b[o]);
+                    for (j, row) in rows.chunks_exact_mut(n_out).enumerate() {
+                        row[o] = by_out[o * t + first + j] + b;
+                    }
+                }
+            });
         out
     }
 
