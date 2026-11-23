@@ -60,6 +60,24 @@ impl CpuBackend {
     }
 }
 
+impl CpuBackend {
+    /// `f(row, out)` for every `width`-wide row of `x`, rows in parallel, each
+    /// result written to the matching row of the returned `Vec`.
+    fn map_rows(&self, x: &[f32], width: usize, f: impl Fn(&[f32], &mut [f32]) + Sync) -> Vec<f32> {
+        assert_eq!(x.len() % width, 0);
+        let rows = self.chunk(x.len(), 8192).div_ceil(width);
+        let mut out = vec![0.0; x.len()];
+        self.pool
+            .for_each_chunk_mut(&mut out, rows * width, |c, out| {
+                let pairs = x[c * rows * width..]
+                    .chunks_exact(width)
+                    .zip(out.chunks_exact_mut(width));
+                pairs.for_each(|(row, out)| f(row, out));
+            });
+        out
+    }
+}
+
 impl Default for CpuBackend {
     /// `INFERENCE_THREADS` if set, else one thread per core up to 8.
     // shortcut: the cap of 8 is measured on an M3 Max (10 performance + 4
@@ -285,31 +303,25 @@ impl Backend for CpuBackend {
     fn layernorm(&self, x: &[f32], gamma: &[f32], beta: &[f32], eps: f32) -> Vec<f32> {
         let width = gamma.len();
         assert_eq!(beta.len(), width);
-        assert_eq!(x.len() % width, 0);
-        let mut out = Vec::with_capacity(x.len());
-        for row in x.chunks_exact(width) {
+        self.map_rows(x, width, |row, out| {
             let mean = row.iter().sum::<f32>() / width as f32;
             let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / width as f32;
             let inv_std = 1.0 / (var + eps).sqrt();
-            out.extend(
-                row.iter()
-                    .zip(gamma.iter().zip(beta))
-                    .map(|(v, (g, b))| (v - mean) * inv_std * g + b),
-            );
-        }
-        out
+            let params = gamma.iter().zip(beta);
+            for ((o, v), (g, b)) in out.iter_mut().zip(row).zip(params) {
+                *o = (v - mean) * inv_std * g + b;
+            }
+        })
     }
 
     fn rmsnorm(&self, x: &[f32], gamma: &[f32], eps: f32) -> Vec<f32> {
         let width = gamma.len();
-        assert_eq!(x.len() % width, 0);
-        let mut out = Vec::with_capacity(x.len());
-        for row in x.chunks_exact(width) {
-            let mean_sq = dot(row, row) / width as f32;
-            let scale = 1.0 / (mean_sq + eps).sqrt();
-            out.extend(row.iter().zip(gamma).map(|(v, g)| v * scale * g));
-        }
-        out
+        self.map_rows(x, width, |row, out| {
+            let scale = 1.0 / (dot(row, row) / width as f32 + eps).sqrt();
+            for ((o, v), g) in out.iter_mut().zip(row).zip(gamma) {
+                *o = v * scale * g;
+            }
+        })
     }
 
     fn swiglu(&self, gate_up: &[f32], width: usize) -> Vec<f32> {
@@ -342,20 +354,25 @@ impl Backend for CpuBackend {
     fn rope(&self, x: &mut [f32], pos0: usize, n_heads: usize, head_dim: usize, inv_freq: &[f32]) {
         let half = head_dim / 2;
         assert_eq!(inv_freq.len(), half);
-        assert_eq!(x.len() % (n_heads * head_dim), 0);
-        for (i, row) in x.chunks_exact_mut(n_heads * head_dim).enumerate() {
-            let pos = (pos0 + i) as f32;
-            // The angles depend on the position and pair index only, so every head shares them.
-            let angles: Vec<(f32, f32)> = inv_freq.iter().map(|f| (pos * f).sin_cos()).collect();
-            for head in row.chunks_exact_mut(head_dim) {
-                let (lo, hi) = head.split_at_mut(half);
-                for (j, &(sin, cos)) in angles.iter().enumerate() {
-                    let (a, b) = (lo[j], hi[j]);
-                    lo[j] = a * cos - b * sin;
-                    hi[j] = b * cos + a * sin;
+        let width = n_heads * head_dim;
+        assert_eq!(x.len() % width, 0);
+        let rows = self.chunk(x.len(), 8192).div_ceil(width);
+        self.pool.for_each_chunk_mut(x, rows * width, |c, chunk| {
+            for (i, row) in chunk.chunks_exact_mut(width).enumerate() {
+                let pos = (pos0 + c * rows + i) as f32;
+                // The angles depend on the position and pair index only, so every head shares them.
+                let angles: Vec<(f32, f32)> =
+                    inv_freq.iter().map(|f| (pos * f).sin_cos()).collect();
+                for head in row.chunks_exact_mut(head_dim) {
+                    let (lo, hi) = head.split_at_mut(half);
+                    for (j, &(sin, cos)) in angles.iter().enumerate() {
+                        let (a, b) = (lo[j], hi[j]);
+                        lo[j] = a * cos - b * sin;
+                        hi[j] = b * cos + a * sin;
+                    }
                 }
             }
-        }
+        });
     }
 
     fn gelu(&self, x: &mut [f32]) {
@@ -393,25 +410,36 @@ impl Backend for CpuBackend {
         let scale = 1.0 / (head_dim as f32).sqrt();
 
         let mut out = vec![0.0; t * q_dim];
-        // One task per (query, head): chunk `idx` of `out` is that head's slot.
-        self.pool.for_each_chunk_mut(&mut out, head_dim, |idx, o| {
-            let (i, h) = (idx / n_heads, idx % n_heads);
-            let kv_off = (h / group) * head_dim;
-            let qv = &q[i * q_dim + h * head_dim..][..head_dim];
-            // The causal mask: key j > pos0 + i is never scored, which is the
-            // same as a -inf score before softmax.
-            let n_keys = pos0 + i + 1;
-            let mut scores: Vec<f32> = (0..n_keys)
-                .map(|j| dot(qv, &k[j * kv_dim + kv_off..][..head_dim]) * scale)
-                .collect();
-            softmax_in_place(&mut scores);
-            for (j, p) in scores.iter().enumerate() {
-                let vj = &v[j * kv_dim + kv_off..][..head_dim];
-                for (acc, x) in o.iter_mut().zip(vj) {
-                    *acc = p.mul_add(*x, *acc);
+        // Work items are (query, head) pairs, item `idx` owning chunk `idx` of
+        // `out`. A task takes several when there are many (a whole query's
+        // heads in prefill, where one item is ~2 us), one in decode.
+        let per_task = (t * n_heads)
+            .div_ceil(self.pool.threads() * 4)
+            .clamp(1, n_heads);
+        self.pool
+            .for_each_chunk_mut(&mut out, per_task * head_dim, |c, chunk| {
+                let mut scores = Vec::new();
+                for (j, o) in chunk.chunks_exact_mut(head_dim).enumerate() {
+                    let idx = c * per_task + j;
+                    let (i, h) = (idx / n_heads, idx % n_heads);
+                    let kv_off = (h / group) * head_dim;
+                    let qv = &q[i * q_dim + h * head_dim..][..head_dim];
+                    // The causal mask: key j > pos0 + i is never scored, which is the
+                    // same as a -inf score before softmax.
+                    let n_keys = pos0 + i + 1;
+                    scores.clear();
+                    scores.extend(
+                        (0..n_keys).map(|j| dot(qv, &k[j * kv_dim + kv_off..][..head_dim]) * scale),
+                    );
+                    softmax_in_place(&mut scores);
+                    for (j, p) in scores.iter().enumerate() {
+                        let vj = &v[j * kv_dim + kv_off..][..head_dim];
+                        for (acc, x) in o.iter_mut().zip(vj) {
+                            *acc = p.mul_add(*x, *acc);
+                        }
+                    }
                 }
-            }
-        });
+            });
         out
     }
 }
@@ -497,8 +525,9 @@ mod tests {
             .collect();
         let dequantized_w = Matrix::new(n_out, n_in, dequantized_w);
         let bias = data(n_out, 6);
-        // 1 token takes the decode path; 2 and 9 the prefill one, with a token tail
-        for t in [1, 2, 9] {
+        // 1 token takes the decode path; 2 and 9 the prefill one, with a token tail;
+        // 40 is enough values to split the quantization into several tasks
+        for t in [1, 2, 9, 40] {
             let x = data(t * n_in, 8);
             let mut dequantized_x = Vec::new();
             // blocks never straddle two tokens: each token ends in a partial one
@@ -526,8 +555,8 @@ mod tests {
         // one row, width 2: silu(1) * 2 and silu(-1) * 3
         let got = cpu().swiglu(&[1., -1., 2., 3.], 2);
         assert_close(&got, &[1.4621172, -0.8068243], 1e-6, 0.0);
-        // more rows than one chunk, so the flat-index walk crosses row ends
-        let (rows, width) = (3, 700);
+        // more values than one task takes (8192), so tasks start mid-row and cross row ends
+        let (rows, width) = (30, 700);
         let x = data(rows * 2 * width, 5);
         let got = cpu().swiglu(&x, width);
         for r in 0..rows {
@@ -546,6 +575,37 @@ mod tests {
         let mut x = [1., 5., 0., 7.];
         cpu().rope(&mut x, 1, 1, 4, &[std::f32::consts::FRAC_PI_2, 0.0]);
         assert_close(&x, &[0., 5., 1., 7.], 1e-6, 0.0);
+    }
+
+    // Enough rows to be several tasks: each must start at its own position.
+    #[test]
+    fn rope_and_norms_over_many_rows_equal_row_by_row() {
+        let (n_heads, head_dim, rows) = (2, 4, 3000);
+        let width = n_heads * head_dim;
+        let inv_freq = [1.0, 0.01];
+        let x = data(rows * width, 11);
+        let mut all = x.clone();
+        cpu().rope(&mut all, 7, n_heads, head_dim, &inv_freq);
+        let gamma = data(width, 12);
+        let beta = data(width, 13);
+        let (ln, rms) = (
+            cpu().layernorm(&x, &gamma, &beta, 1e-5),
+            cpu().rmsnorm(&x, &gamma, 1e-5),
+        );
+        for i in 0..rows {
+            let row = &x[i * width..(i + 1) * width];
+            let mut one = row.to_vec();
+            cpu().rope(&mut one, 7 + i, n_heads, head_dim, &inv_freq);
+            assert_close(&all[i * width..(i + 1) * width], &one, 1e-6, 1e-6);
+            let at = i * width..(i + 1) * width;
+            assert_close(
+                &ln[at.clone()],
+                &cpu().layernorm(row, &gamma, &beta, 1e-5),
+                1e-6,
+                1e-6,
+            );
+            assert_close(&rms[at], &cpu().rmsnorm(row, &gamma, 1e-5), 1e-6, 1e-6);
+        }
     }
 
     #[test]
