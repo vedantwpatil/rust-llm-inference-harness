@@ -49,6 +49,7 @@ pub trait Model {
         eos: &[u32],
         on_token: &mut dyn FnMut(u32),
     ) {
+        assert!(!prompt.is_empty(), "the prompt has no tokens");
         let mut cache = self.new_cache();
         let mut logits = self.forward(prompt, &mut cache);
         for step in 0..max_new {

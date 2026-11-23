@@ -12,19 +12,20 @@
 /// accumulator registers and should stay at or below 16 (of 32).
 // The loop indices are pointer offsets here, not just slice positions.
 #[allow(clippy::needless_range_loop)]
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 pub fn tile<const R: usize, const T: usize, const U: usize>(
     w: &[f32],
     x: &[f32],
     k: usize,
 ) -> [[f32; T]; R] {
     use std::arch::aarch64::*;
-    assert!(w.len() >= R * k && x.len() >= T * k);
+    // `k <= len / R`, not `len >= R * k`: the product can wrap in release builds.
+    assert!(k <= w.len() / R && k <= x.len() / T);
     // The vector loop takes whole groups of 4 * U floats; a scalar loop does the rest.
     let main = k / (4 * U) * (4 * U);
     let mut out = [[0.0f32; T]; R];
 
-    // SAFETY: NEON is part of the aarch64 baseline. Every load reads 4 floats
+    // SAFETY: the cfg gate guarantees NEON. Every load reads 4 floats
     // at `row * k + kk + 4 * u` with `kk + 4 * U <= main <= k` and `row < R`
     // (or `< T`), so it lies inside row `row` of `w` (or `x`), and the assert
     // above guarantees those rows exist.
@@ -72,13 +73,14 @@ pub fn tile<const R: usize, const T: usize, const U: usize>(
 
 // shortcut: a scalar loop, not vectorized by hand, so the crate builds off
 // Apple Silicon; write an AVX2 or generic-SIMD tile when a second target matters.
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
 pub fn tile<const R: usize, const T: usize, const U: usize>(
     w: &[f32],
     x: &[f32],
     k: usize,
 ) -> [[f32; T]; R] {
-    assert!(w.len() >= R * k && x.len() >= T * k);
+    // `k <= len / R`, not `len >= R * k`: the product can wrap in release builds.
+    assert!(k <= w.len() / R && k <= x.len() / T);
     let mut out = [[0.0f32; T]; R];
     for r in 0..R {
         for t in 0..T {
@@ -101,13 +103,13 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// row's scale. Decode is memory-bound, so the point is to read a quarter of the
 /// bytes `dot` reads; the widening to f32 happens in registers, 16 weights per
 /// step, into four accumulators so the fused multiply-adds overlap.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 pub fn dot_q8(w: &[i8], x: &[f32]) -> f32 {
     use std::arch::aarch64::*;
     assert_eq!(w.len(), x.len());
     let main = w.len() / 16 * 16;
     let mut sum;
-    // SAFETY: NEON is part of the aarch64 baseline. Each step loads 16 bytes
+    // SAFETY: the cfg gate guarantees NEON. Each step loads 16 bytes
     // from `w` and 4 floats four times from `x`, all starting below `main`
     // and ending at most at `main <= len`, which the assert ties to both slices.
     unsafe {
@@ -139,7 +141,7 @@ pub fn dot_q8(w: &[i8], x: &[f32]) -> f32 {
 
 // shortcut: scalar loop off aarch64, like `tile`; write an AVX2 version when a
 // second target matters.
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
 pub fn dot_q8(w: &[i8], x: &[f32]) -> f32 {
     assert_eq!(w.len(), x.len());
     w.iter().zip(x).map(|(&q, v)| q as f32 * v).sum()

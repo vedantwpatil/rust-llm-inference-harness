@@ -35,16 +35,16 @@ fn main() {
     let ids = tok.encode(&chatml(common::SYSTEM, &prompt));
 
     let start = Instant::now();
-    let (mut first, mut new_tokens) = (None, 0);
+    let (mut first, mut generated) = (None, 0usize);
     // Bytes of a character cut between two tokens wait here for the next one.
     let mut pending = Vec::new();
     let mut out = std::io::stdout().lock();
     model.generate_each(&ids, max_new, &eos, &mut |id| {
         first.get_or_insert_with(|| start.elapsed());
+        generated += 1;
         if eos.contains(&id) {
             return;
         }
-        new_tokens += 1;
         match tok.decode_stream(id, &mut pending) {
             Ok(text) => write!(out, "{text}").unwrap(),
             Err(_) => {
@@ -54,12 +54,17 @@ fn main() {
         }
         out.flush().unwrap();
     });
-    let (first, total) = (first.unwrap(), start.elapsed());
+    let total = start.elapsed();
+    let first = first.unwrap_or(total);
+    // The first token comes out of prefill, so the rate counts only the rest.
+    let rate = match generated {
+        0 | 1 => "n/a".to_string(),
+        n => format!("{:.1}", (n - 1) as f64 / (total - first).as_secs_f64()),
+    };
     eprintln!(
-        "\n[{} prompt tokens, first token after {:.0} ms; {new_tokens} reply tokens at {:.1} tok/s{}]",
+        "\n[{} prompt tokens, first token after {:.0} ms; {generated} tokens generated, {rate} tok/s after the first{}]",
         ids.len(),
         first.as_secs_f64() * 1e3,
-        (new_tokens - 1) as f64 / (total - first).as_secs_f64(),
         if int8 { ", int8 weights" } else { "" }
     );
 }

@@ -47,10 +47,13 @@ fn memory_bandwidth() -> f64 {
     (data.len() * 4) as f64 / best
 }
 
+/// Seconds spent in each of `OPS`.
+type Secs = [f64; OPS.len()];
+
 /// Wraps a backend and adds up the time spent in each op: where a token goes.
 struct Timed<B> {
     inner: B,
-    secs: Rc<RefCell<[f64; 8]>>,
+    secs: Rc<RefCell<Secs>>,
 }
 
 const OPS: [&str; 8] = [
@@ -103,8 +106,8 @@ impl<B: Backend> Backend for Timed<B> {
 /// Milliseconds per op for one prefill of `ids` and per decoded token, plus
 /// how much of each pass the ops account for (the rest is copies, residual
 /// adds and allocation).
-fn breakdown(model: &dyn Model, secs: &RefCell<[f64; 8]>, ids: &[u32]) {
-    let report = |label: &str, total: f64, secs: [f64; 8], per: f64| {
+fn breakdown(model: &dyn Model, secs: &RefCell<Secs>, ids: &[u32]) {
+    let report = |label: &str, total: f64, secs: Secs, per: f64| {
         let parts: Vec<String> = OPS
             .iter()
             .zip(secs)

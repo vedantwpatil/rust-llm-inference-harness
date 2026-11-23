@@ -6,7 +6,8 @@ use std::cell::RefCell;
 thread_local! {
     // Widened int8 weight rows for the prefill path, one buffer per pool thread
     // so a task never allocates: a 16-row slab of the widest matrix is ~300 KB,
-    // and a fresh allocation that size would page-fault on every call.
+    // and a fresh allocation that size would page-fault on every call. The
+    // borrow is never re-entered because a pool task must not call `Pool::run`.
     static WIDENED: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
 }
 
