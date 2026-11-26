@@ -8,20 +8,23 @@ For adding agents and subagents to the harness read stage in progress plus [Cros
 
 ## Status
 
-| Stage | What                      | Status      |
-| ----- | ------------------------- | ----------- |
-| 1     | Tokenizer: byte-level BPE | Done        |
-| 2     | GPT-2 small on CPU        | In progress |
-| 3     | Llama-style model + int8  | Not started |
-| 4     | Inference harness traits  | Not started |
-| 5     | Coding harness            | Not started |
-| 6     | Stretch: Metal or serving | Undecided   |
+| Stage | What                               | Status      |
+| ----- | ---------------------------------- | ----------- |
+| 1     | Tokenizer: byte-level BPE          | Done        |
+| 2     | GPT-2 small on CPU                 | Done        |
+| 3     | Llama-style model + int8           | Done        |
+| 4     | Inference harness traits           | Not started |
+| 5     | Metal backend + 4-bit quantization | Not started |
+| 6     | Coding harness                     | Not started |
+| 7     | Stretch: serving or speculative    | Open        |
 
 ## The stack at a glance
 
 ```text
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│ 5  Coding harness     agent loop · tools · context budget                   │
+│ 6  Coding harness     agent loop · tools · append-only context · evals      │
+├─────────────────────────────────────────────────────────────────────────────┤
+│ 5  Metal + 4-bit      GPU kernels · backend-owned buffers · Q4 · f16 cache  │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │ 4  Inference harness  Session · LogitProcessor · Sampler · StopCondition    │
 ├─────────────────────────────────────────────────────────────────────────────┤
@@ -96,7 +99,7 @@ Diagram legend, used in every stage below:
 - **Logits:** one raw score per vocabulary entry for what next token should be. Picking from them (argmax, sampling) yields next id.
 - **Prefill / decode:** prefill runs whole prompt through model in one pass. Decode then produces one token at a time. Prefill compute-bound (matrix times matrix), decode memory-bound (matrix times vector).
 - **KV cache:** attention keys and values of every past token, kept per layer so decode does not recompute.
-- **Roofline:** speed ceiling set by memory bandwidth. Decode reads every weight once per token, so tokens/sec at most memory bandwidth divided by bytes read per token. Roughly 0.5 GB f32 weights on 100 GB/s machine gives ceiling near 200 tok/s (illustrative numbers, real hardware still to be measured).
+- **Roofline:** speed ceiling set by memory bandwidth. Decode reads every weight once per token, so tokens/sec at most memory bandwidth divided by bytes read per token. Measured baselines on Apple M3 Max live in [DEVELOPMENT_NOTES.md](DEVELOPMENT_NOTES.md#speed).
 
 ## Principles for every stage
 
@@ -140,12 +143,12 @@ decode
 
 Complete and checked against tiktoken's `gpt2` encoding, apart from the decisions below. Structure: [ARCHITECTURE.md](ARCHITECTURE.md). Reasoning: [DEVELOPMENT_NOTES.md](DEVELOPMENT_NOTES.md).
 
-**Feeds:** stage 2 (ids in and out), stage 4 (id-to-bytes table for grammar masks, streaming decode), stage 5 (token counting, chat-template special tokens).
+**Feeds:** stage 2 (ids in and out), stage 4 (id-to-bytes table for grammar masks, streaming decode), stage 6 (token counting, chat-template special tokens).
 
 **Open decisions in stage 1**
 
-- **Encoder speed.** Three steps, each benchmarked against the [baseline](DEVELOPMENT_NOTES.md#benchmarks) before the next. (1) Ids, not `String`s: `byte_ids` table and `(left id, right id) -> (rank, merged id)` map built once in `Tokenizer::new`, no per-merge allocation or string hashing. (2) Incremental ranks: rank per adjacent pair, recompute only the two pairs a merge touches. (3) Heap plus linked list, staleness check on pop, O(n log n). The long-chunk case needs step 3: `Vec::remove` and the per-round rescan keep steps 1 and 2 quadratic. Per-chunk caching (GPT-2's trick) needs interior mutability, belongs with stage 4 concurrency. Set a target number after step 1. Oracle tests and benchmark hashes guard correctness. The two direct `encode_chunk` unit tests need porting when its signature changes.
-- **Special tokens in input.** Specials in text always become their id. tiktoken refuses them unless `allowed_special` allows them, which matters once untrusted text reaches the tokenizer (stage 5, chat templates). Decide by then whether `encode` takes an allow-list.
+- **Encoder speed (deferred).** Current speed (~5.75 MB/s, [baseline](DEVELOPMENT_NOTES.md#benchmarks)) tokenizes a 4,000-token coding prompt in a few milliseconds, so beating tiktoken is not a goal. Revisit only if tokenization shows up in stage 6 profiling (path: integer id tables instead of `String`s, incremental adjacent-pair ranks, heap plus linked list for O(n log n)).
+- **Special tokens in input.** Specials in text always become their id. tiktoken refuses them unless `allowed_special` allows them, which matters once untrusted text (file contents, command output) reaches the tokenizer in stage 6. Decide before stage 6 whether `encode` takes an allow-list.
 - **Count type.** Pair counts are `u32` and overflow past about 4.29e9 occurrences of one pair. Irrelevant at toy scale, revisit before training on a real corpus. See [I32_VS_U32.md](I32_VS_U32.md).
 - **Id-to-bytes table.** Needed by stage 4. `Tokenizer.vocab` holds GPT-2 symbol chars, and converting them needs `char_to_byte` (`pub(crate)`). Needs a public way to get each id's raw bytes. `inference` takes the table as data for grammar masks and stop strings ([Crate map](#crate-map)).
 
@@ -198,7 +201,7 @@ Inside forward pass, each of 12 blocks = two residual steps. `(+)` adds block's 
 - **Tensor ops behind `Backend` trait from day one:** matmul, LayerNorm, GELU, softmax, causal attention. CPU implementation = correctness reference (see [Cross-stage constraints](#cross-stage-constraints)).
 - **Forward pass and greedy loop,** verified layer by layer against Hugging Face.
 - **KV cache and prefill/decode split.** Prefill pushes whole prompt through in one matmul-heavy pass. Decode feeds one token, reuses cached keys and values. Per token cache costs 2 x 12 layers x 768 x 4 bytes, about 72 KiB at f32.
-- **Speed:** SIMD matmul, rayon across cores, then benchmark and writeup.
+- **Speed:** NEON matmul kernels across a thread pool, then benchmark and writeup.
 
 **Done when**
 
@@ -214,7 +217,7 @@ Inside forward pass, each of 12 blocks = two residual steps. `(+)` adds block's 
 - Attention scales by 1/sqrt(head_dim), applies causal mask before softmax.
 - No separate `lm_head` tensor, it is tied `wte`.
 - Decode is matvec reading every weight each token. Will not be compute-bound, that is the point of roofline.
-- `Backend` and `CpuBackend` start as an `inference` module using no model code, so they can become the `backend` crate at stage 6A. `Model<B: Backend>` generic: static dispatch in the hot path. See [Crate map](#crate-map).
+- `Backend` and `CpuBackend` start as an `inference` module using no model code, so they can become the `backend` crate at stage 5. `Model<B: Backend>` generic: static dispatch in the hot path. See [Crate map](#crate-map).
 
 **Needs:** stage 1. **Feeds:** stage 3 (same skeleton, new parts), stage 4 (loop split into traits).
 
@@ -222,7 +225,7 @@ Inside forward pass, each of 12 blocks = two residual steps. `(+)` adds block's 
 
 ## Stage 3: Llama-style model and int8
 
-**What it is.** Modern architecture: Llama 3.2 1B or small Qwen coder model. Skeleton stays (embed, N blocks, final norm, logits) but four parts swapped, weights get quantized. Coder-capable model also what stage 5 needs.
+**What it is.** Modern architecture: Llama 3.2 1B or small Qwen coder model. Skeleton stays (embed, N blocks, final norm, logits) but four parts swapped, weights get quantized. Coder-capable architecture also what stage 6 needs (scaled up to `Qwen2.5-Coder-7B-Instruct` once stage 5 adds Metal and 4-bit weights).
 
 ```text
 GPT-2 (stage 2)                      Llama-style (stage 3)
@@ -259,12 +262,12 @@ GPT-2 (stage 2)                      Llama-style (stage 3)
 - **GQA (grouped-query attention):** several query heads share one key/value head. Llama 3.2 1B has 32 query heads and 8 KV heads, so KV cache 4x smaller than full multi-head attention.
 - **SwiGLU:** gated MLP, `down(silu(gate(x)) * up(x))`, three matrices instead of two.
 
-Quantization = separate pass over loaded weights. Weights stored as int8 with scales (per channel or per small group), activations stay f32, dequantization happens inside matvec. Decode bandwidth-bound, so 4x fewer bytes than f32 should give close to 4x faster decode.
+Quantization = separate pass over loaded weights. Weights stored as int8 with a scale per row, and the matmul rounds its activations to int8 too, one scale per block of 128 values, so the inner loop is an integer dot product. Decode bandwidth-bound, so 4x fewer bytes than f32 should give close to 4x faster decode.
 
 ```text
                ╔════════════╗    ╔═════════════════╗    ╔═════════════════╗
-               ║ Quantize   ║    ║ int8 W          ║    ║ matvec: dequant ║
-f32 weights ─▶ ║ (offline)  ║ ─▶ ║ + f32 scales    ║ ─▶ ║ inside the loop ║ ─▶ f32 out
+               ║ Quantize   ║    ║ int8 W          ║    ║ int8 dot (sdot) ║
+f32 weights ─▶ ║ (offline)  ║ ─▶ ║ + f32 scales    ║ ─▶ ║ x rounded to i8 ║ ─▶ f32 out
                ╚════════════╝    ╚═════════════════╝    ╚═════════════════╝
 ```
 
@@ -273,7 +276,7 @@ f32 weights ─▶ ║ (offline)  ║ ─▶ ║ + f32 scales    ║ ─▶ ║ 
 - Loader for new checkpoint format and `config.json` parsing into model config.
 - New `Backend` ops: `rmsnorm`, `rope`, SiLU/SwiGLU, GQA-aware attention.
 - **Tokenizer generalization:** Llama 3 and Qwen ship own byte-level BPE vocabulary (about 128K entries for Llama 3), pre-tokenizer pattern, special tokens. Stage 1 code must load these as data.
-- Weight-only int8 quantization, at load time or via offline converter.
+- int8 quantization of the weights at load time, and of the activations inside each matmul.
 
 **Done when**
 
@@ -288,7 +291,7 @@ f32 weights ─▶ ║ (offline)  ║ ─▶ ║ + f32 scales    ║ ─▶ ║ 
 - GQA needs each KV head broadcast to its group of query heads.
 - Read `config.json` for remaining deltas (tied embeddings, biases, norm epsilon) instead of assuming.
 
-**Needs:** stage 2 (loader, `Backend`, KV cache), stage 1 generalized. **Feeds:** stage 4, stage 5 (model worth driving).
+**Needs:** stage 2 (loader, `Backend`, KV cache), stage 1 generalized. **Feeds:** stage 4, stage 5 (Metal kernels and 4-bit weights), stage 6 (model worth driving).
 
 ---
 
@@ -328,8 +331,8 @@ f32 weights ─▶ ║ (offline)  ║ ─▶ ║ + f32 scales    ║ ─▶ ║ 
            generated ids
 ```
 
-- **`Session`:** per-conversation state. Owns KV cache and position. `prefill` takes prompt, `decode` takes one id, both return logits.
-- **`LogitProcessor`:** edits logits before sampling: repetition penalty, banned tokens, grammar masks.
+- **`Session`:** per-conversation state. Owns KV cache, position, and a reusable logits buffer. `prefill` takes prompt or delta ids (for multi-turn prefix reuse), `decode` takes one id, and `truncate(len)` rolls the cache back to an earlier position; forward steps return `&mut [f32]` logits so processors edit in place without a 608 KiB copy per token.
+- **`LogitProcessor`:** edits logits in place before sampling: repetition penalty, banned tokens, grammar masks.
 - **`Sampler`:** picks next id: greedy, temperature, top-k, top-p, with seeded RNG so tests reproducible.
 - **`StopCondition`:** end of sequence, max tokens, stop strings. Stop strings can span tokens: match on a rolling buffer of recent token bytes. Needs only the id-to-bytes table, immune to characters cut between tokens.
 
@@ -347,98 +350,37 @@ Sessions borrow read-only weights, so many can exist at once. Cheap hook for ser
 ╚══════════════════════════╝
 ```
 
-**One feature on top: grammar-constrained decoding.** `LogitProcessor` that sets logits of every token that would break grammar (for example valid JSON) to negative infinity. Needs stage 1's id-to-bytes table. Hard parts: computing allowed-token mask quickly at every step, and tokens that cross grammar boundaries. In stage 5 this makes tool calls from small local model reliable.
+**One feature on top: grammar-constrained decoding.** Triggered `LogitProcessor` that stays idle during normal text/reasoning, activates on the model's tool-call start token (for example `<tool_call>`), and sets logits of every token that would break the tool schema to negative infinity until the closing tag. Implemented as a Rust finite-state machine for flat JSON tool schemas compiled once against stage 1's id-to-bytes table (byte trie into precomputed per-state bitmasks, ~19 KiB per state for Qwen's 151,936 vocabulary, microseconds per decode step), with optional jump-forward for forced boilerplate runs. In stage 6 this makes tool calls from local models reliable without the complexity of a general context-free parser.
 
 **Done when**
 
 - Stage 2 and 3 greedy output unchanged when run through traits.
 - Two interleaved sessions produce same output as same two run separately.
+- Incremental multi-turn `prefill` + `truncate` matches fresh full-prompt prefill.
 - Constrained output always parses.
 
 **Watch for**
 
 - State belongs to session (KV cache, processor state, RNG), never shared model.
 - Design question to settle here: generics versus `dyn` for traits. Per-token virtual call negligible next to forward pass, so favour whichever reads simpler. Leaning: both, by role. Generics for `Backend` (`Model<B: Backend>`, hot path). `dyn` for processors: `Vec<Box<dyn LogitProcessor>>` chains different types. Keep `LogitProcessor` object-safe (no generic methods, no `self` by value); losing that breaks every `dyn` user.
-- Raise this stage's [concerns](#concerns-to-raise-during-development) first: tokenizer code vs data (`todo!()` sketch), sampling as a separate call, `Session` return types and `Send`, continuous batching.
+- Raise this stage's [concerns](#concerns-to-raise-during-development) first: tokenizer code vs data (`todo!()` sketch), sampling as a separate call, `Session` return types (`&mut [f32]`) and `Send`, continuous batching, `KvCache` rollback/clone, all-position logits, grammar jump-forward.
 
-**Needs:** stages 1-3. **Feeds:** stage 5, and stage 6 if serving chosen.
-
----
-
-## Stage 5: Coding harness
-
-**What it is.** Agent loop around model: read task, call tool, see result, repeat until done. Drives local inference (stages 2-4) directly, no `Model` trait. Starts only after inference pipeline works.
-
-```text
-              user task
-                  │
-                  ▼
-╔═══════════════════════════════════╗
-║ Context builder                   ║
-║ history + tool results,           ║◀──┐
-║ trimmed to token budget           ║   │
-╚═════════════════╤═════════════════╝   │
-                  │  messages           │
-                  ▼                     │
-╔═══════════════════════════════════╗   │
-║ Local model (stages 2-4)          ║   │
-║ Session + Sampler + grammar mask  ║   │
-║                                   ║   │
-╚═════════════════╤═════════════════╝   │
-                  │  completion         │ result appended
-                  ▼                     │
-╔═══════════════════════════════════╗   │
-║ Parse response                    ║   │
-║ tool call or final answer         ║   │
-╚═════════════════╤═════════════════╝   │
-                  │  tool call          │
-                  ▼                     │
-╔═══════════════════════════════════╗   │
-║ Tool executor                     ║   │
-║ read · edit · grep · run          ║───┘
-╚═══════════════════════════════════╝
-```
-
-**Scope**
-
-- **Local model only.** Loop calls stage 4's `Session` and `Sampler` directly.
-- **Context builder:** system prompt, history, tool results. Counts tokens with our tokenizer, trims or summarizes oldest tool output when over budget.
-- **Chat template and special tokens** for local model. Format differs per model. Templates live in `tokenizer` (HF ships them in `tokenizer_config.json` with the specials).
-- **Tool-call parsing:** structured (JSON) calls from model output, with stage 4's grammar constraint on local models.
-- **Tools:** read file, edit file, grep or glob, run command. Writes and commands ask permission.
-- **Loop exit:** model answers without tool call, step cap hit, or budget runs out.
-
-**Done when**
-
-- Completes small real task (for example making failing test pass in toy repo) on the local model.
-- Never overflows context window.
-- Malformed tool call reported back to model instead of crashing loop.
-
-**Watch for**
-
-- Token counts must match model actually in use. Local only, so our tokenizer counts.
-- Small local models unreliable at tool-call syntax. Constrain output instead of prompting harder.
-
-**Needs:** stages 1 and 4, and working local model. **Feeds:** nothing, top layer.
+**Needs:** stages 1-3. **Feeds:** stage 5 (overlapped CPU masking during GPU forward pass), stage 6 (multi-turn coding sessions and constrained tool calls), stage 7 (serving and speculative decoding).
 
 ---
 
-## Stage 6: Stretch decision (open)
+## Stage 5: Metal backend and 4-bit quantization
 
-Pick one after stage 5. Choice can wait, but it puts two design constraints on earlier stages (see [Cross-stage constraints](#cross-stage-constraints)).
-
-### Option A: Metal backend
-
-`Backend` implementation on Apple GPU: matvec kernel for decode, tiled matmul for prefill, fused attention, int8 dequant inside kernel. Weights mmap'd and shared through unified memory.
+**What it is.** Move the forward pass onto Apple's GPU through Metal, and add 4-bit group quantization plus 16-bit floating-point KV cache. Placed before the coding harness for two reasons: (1) the core goal is measured systems work against `llama.cpp` and `mlx-lm`, and `mlx-lm` runs on the GPU; (2) a coding harness needs a capable coder model (`Qwen2.5-Coder-7B-Instruct`, ~4.2 GB at 4-bit) to finish real multi-step edits reliably, and 4-bit weights on Metal make 7B fast on unified memory instead of spending weeks fighting 0.5B capability limits.
 
 ```text
 ┌────────────────────────────────────────────────┐
 │ Model forward pass (stages 2-3)                │
 └────────────────────────┬───────────────────────┘
-                         │  calls
+                         │  calls (device handles, one command buffer/step)
                          ▼
 ┌────────────────────────────────────────────────┐
-│ trait Backend                                  │
+│ trait Backend (backend crate)                  │
 │ matmul · rmsnorm · rope · softmax · attention  │
 └───────────┬────────────────────────┬───────────┘
             ▼                        ▼
@@ -449,11 +391,97 @@ Pick one after stage 5. Choice can wait, but it puts two design constraints on e
     outputs compared op by op in tests
 ```
 
-- **Hard parts:** kernel correctness against CPU reference, per-op dispatch overhead, unsafe FFI and buffer lifetimes.
-- **First step:** move `Backend`, tensor type and `CpuBackend` into a `backend` crate, so `metal` never depends on model code ([Crate map](#crate-map)).
-- **Results to report:** tok/s CPU vs Metal, share of memory-bandwidth roofline, tok/s vs llama.cpp and mlx-lm.
+**Why `Backend` changes here.** Today's `Backend` takes host slices (`&[f32]`) and returns owned `Vec<f32>`, while `Matrix` holds CPU-packed bytes and `KvCache` appends on the CPU. Running Metal behind that host-slice signature would submit and synchronize ~200 command buffers per decoded token, making the GPU slower than the CPU path. Step 0 of this stage splits `backend` into its own crate and redesigns `Backend` around backend-owned handles (`type Tensor`, `type Weight`, `type Cache`), a per-step command-buffer scope (`begin_step` / `finish_step`), and optional default fused methods (such as `add_rmsnorm` and fused `rope` + cache append) that `CpuBackend` inherits from its primitives while `MetalBackend` overrides with single fused shaders. That keeps one shared `Gpt2<B>` and `Llama<B>` implementation verified op-by-op against `CpuBackend` while encoding an entire forward pass into one Metal command buffer.
 
-### Option B: Serving layer
+**Scope**
+
+- **Crate split and handle-based `Backend`:** move `Backend`, tensor/weight types, and `CpuBackend` into a `backend` crate so `metal` never depends on model code ([Crate map](#crate-map)).
+- **Metal kernels:** matrix-vector kernel for decode, tiled matrix-matrix kernel for prefill, fused RMSNorm/RoPE/SwiGLU, attention over GPU-resident KV cache. Weights memory-mapped and shared through Apple unified memory.
+- **Rollout order:** (1) bring up Metal in 32-bit floating-point matching `CpuBackend` within `1e-4`; (2) add Metal 8-bit integer reusing stage 3's verified weights and tune decode to the GPU memory-bandwidth roofline (apples-to-apples CPU vs Metal comparison); (3) add 4-bit group quantization (symmetric 32-element blocks, `Q4_0`-style) with a tiny scalar CPU dequantizer for unit tests and dequantization inside the Metal kernels — halving decode memory traffic again relative to int8 so `Qwen2.5-Coder-7B-Instruct` (~4.2 GB) runs fast on unified memory while `0.5B` stays for fast unit and regression tests.
+- **Multi-shard loading and quantized weight cache:** support multi-file sharded safetensors checkpoints for `7B` and cache quantized 4-bit weights once on disk so startup stays sub-second.
+- **16-bit floating-point KV cache:** halves long-context memory and attention bandwidth before stage 6 feeds multi-kilotoken repository context into a coding session.
+
+**Done when**
+
+- Every Metal op matches `CpuBackend` within float32/quantization tolerance in unit tests; full forward pass matches on GPT-2 and Qwen.
+- 4-bit accuracy (top-1 agreement and perplexity on `eval_int8`-style benchmark) reported alongside f32 and int8.
+- Benchmarks report CPU vs Metal tok/s, share of the Apple Silicon GPU memory-bandwidth roofline, and head-to-head numbers against `llama.cpp` and `mlx-lm` on `Qwen2.5-Coder-0.5B` and `Qwen2.5-Coder-7B-Instruct`.
+
+**Watch for**
+
+- Kernel correctness against CPU reference before fusing or tuning threadgroup layouts.
+- Per-op command-buffer dispatch overhead (encode whole forward pass into one command buffer; avoid host stalls mid-layer).
+- Unsafe FFI and Metal buffer lifetimes across unified memory.
+
+**Needs:** stages 2-4. **Feeds:** stage 6 (fast, capable local coder model), stage 7 (GPU-backed serving or speculative decoding).
+
+---
+
+## Stage 6: Coding harness
+
+**What it is.** Stateful agent control loop around the local model: read task, call constrained tools, inspect verified tool output, repeat until done. Drives stage 4's `Session` and `Sampler` directly (backed by stage 5's fast Metal + 4-bit local model). Starts only after the inference pipeline and local coder model are fast and verified.
+
+```text
+              user task
+                  │
+                  ▼
+╔═══════════════════════════════════╗
+║ Append-only context builder       ║
+║ static prefix + bounded tool      ║◀──┐
+║ outputs (rare explicit compact)   ║   │
+╚═════════════════╤═════════════════╝   │
+                  │  delta ids          │
+                  ▼                     │
+╔═══════════════════════════════════╗   │
+║ Local model (stages 2-5)          ║   │
+║ Session + Sampler + grammar mask  ║   │
+╚═════════════════╤═════════════════╝   │
+                  │  completion         │ result appended
+                  ▼                     │
+╔═══════════════════════════════════╗   │
+║ Parse response                    ║   │
+║ tool call or final answer         ║   │
+╚═════════════════╤═════════════════╝   │
+                  │  tool call          │
+                  ▼                     │
+╔═══════════════════════════════════╗   │
+║ Tool executor + verification      ║   │
+║ read · edit · grep · run          ║───┘
+╚═══════════════════════════════════╝
+```
+
+**Scope**
+
+- **Local model only.** Loop calls stage 4's `Session` and `Sampler` directly over the `Model` trait.
+- **Append-only, prefix-stable context:** keep system instructions and tool definitions fixed at positions `0..P` so multi-turn steps only prefill delta tokens and reuse `Session`'s KV cache. Cap every tool result (bytes/lines, keeping head errors + tail) *before* appending; only run an explicit summarize-and-reset compaction when nearing the context limit instead of deleting middle turns (which shifts RoPE positions and invalidates the cache).
+- **Chat template and special tokens** for the local model. Format differs per model; templates live in `tokenizer` (HF ships them in `tokenizer_config.json` with the specials). Decide the stage 1 `allowed_special` policy here so file contents containing special-token strings cannot inject control tokens.
+- **Grammar-constrained tool calling:** structured JSON calls enforced at the logit level by stage 4's `LogitProcessor`, rather than relying on prompt formatting instructions.
+- **Tools and edit primitives:** small orthogonal set — read file, edit file (exact search-and-replace or whole-file write rather than brittle line-number patches), grep/glob, run command. Writes and shell commands require permission boundaries; malformed or failed tool calls return actionable error text back to the model instead of crashing the loop.
+- **Parser-graph tools (candidate, build only after a grep baseline fails):** a standalone index, usable outside the harness, that parses source with Tree-sitter into units (function, type, line span, signature) and call edges. Exposes `find_symbol` (signatures and locations), `callers` (one hop), and `read_symbol` (one unit's lines, not the whole file). Measure first against the grep baseline on the same tasks, comparing tokens used and pass rate. Syntax only, no types, so common names (`new`, `parse`) link falsely.
+- **Loop exit and recovery:** stop when the model answers without a tool call, hits a step or token budget cap, or repeats identical failing tool calls (loop detection).
+- **Evaluation suite:** fixed set of small, reproducible coding tasks (for example making failing tests pass in toy Rust repos) measuring pass rate, valid tool-call rate, tokens used, and wall time so every harness change is measured rather than guessed.
+
+**Done when**
+
+- Passes the fixed small-task evaluation suite on the local Metal + 4-bit model, with metrics reported (pass rate, tokens, wall time).
+- Multi-turn runs reuse the KV cache prefix instead of re-prefilling history from scratch.
+- Never overflows the context window; malformed or failing tool calls recover cleanly in the loop.
+
+**Watch for**
+
+- Token counts must match the model in use (our tokenizer counts every message and tool result).
+- Untrusted file/command output containing chat-template special tokens (needs stage 1's `allowed_special` handling).
+- Small/medium local models still fail on brittle edit formats and unconstrained syntax — fix the tool primitive and grammar mask before adding prompt prose.
+
+**Needs:** stages 1, 4, and 5. **Feeds:** nothing, top layer.
+
+---
+
+## Stage 7: Stretch options (open)
+
+Optional systems extensions after stage 6 (or whenever wanted once stage 4 exists).
+
+### Option A: Serving layer
 
 axum handler sends each request over channel to one engine loop that owns model and KV caches. Each loop iteration runs one batched decode step over all active sequences, admits new requests (prefill) between steps, retires finished ones. Tokens stream back over SSE.
 
@@ -486,18 +514,11 @@ axum handler sends each request over channel to one engine loop that owns model 
 - **Crates:** the engine loop = batching scheduler, lives in `inference` (needs KV cache internals). `server` = axum and SSE around it ([Crate map](#crate-map)).
 - **Results to report:** aggregate tok/s at 1, 4, 16 concurrent requests, time to first token, p99 inter-token latency, static vs continuous batching.
 
-### Option C (optional third): speculative decoding
+### Option B: Speculative decoding
 
 Small draft model proposes tokens, big model verifies them in one pass, roughly 1.5-2x faster with identical output. Needs two models sharing tokenizer, sits on top of `Sampler` and `Session`. Check available RAM first.
 
-### Leaning: Metal
-
-- Stated goal = measured work against llama.cpp and mlx-lm. mlx-lm runs on GPU, so CPU-only engine loses that comparison by wide margin.
-- Stage 5 = single-user coding harness. Decode speed decides if usable. Batching only helps with many concurrent clients.
-- North star = deep-systems Rust: unsafe FFI, manual buffer lifetimes, kernels verified against reference.
-- Roofline framing (tok/s ~ memory bandwidth / weight bytes) gives concrete efficiency number.
-
-Serving = more transferable skill (vLLM/TGI-style continuous batching), Metal = more interesting build. Continuous batching can come later as add-on instead of being stretch goal.
+Cheaper first variant: prompt lookup decoding. No draft model: match the last few generated tokens against the prompt and propose the tokens that followed there, then verify in one pass. Code edits copy existing code verbatim, so it suits stage 6. It needs the stage 4 hooks: `KvCache` rollback and logits for all verified positions ([concerns](#concerns-to-raise-during-development)).
 
 ---
 
@@ -511,21 +532,21 @@ Workspace under `crates/`, split by side, not stage. Text side (`tokenizer`) and
 
 | Crate                     | Stage               | Holds                                                                                                                                                                                                                                                                                                          | Why a separate crate                                                                                                                                     |
 | ------------------------- | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `tokenizer` (exists)      | 1, 3, 5             | Text side: trainer, encoder, decoder, specials, GPT-2 loader, baselines. Later: id-to-bytes table, Llama and Qwen vocab loading, chat templates                                                                                                                                             | Foundation. Only `fancy-regex`, plus `serde_json` for `tokenizer.json`                                                                                   |
+| `tokenizer` (exists)      | 1, 3, 6             | Text side: trainer, encoder, decoder, specials, GPT-2 and `tokenizer.json` loaders, Qwen's ChatML prompt, baselines. Later: id-to-bytes table, other chat templates                                                                                                                                             | Foundation. Only `fancy-regex`, plus `serde_json` for `tokenizer.json`                                                                                   |
 | `tokenizer-cli` (exists)  | 1                   | Demo and comparison report                                                                                                                                                                                                                                                                                     | Binary, display only                                                                                                                                     |
-| `inference`               | 2, 3, 4, 6B         | Ids side: safetensors loader, GPT-2 and Llama forward passes, KV cache, int8, `Session`, `Sampler`, `LogitProcessor`, `StopCondition` (byte-matched stop strings), grammar masks, generate loop (ids in, ids out), later the batching scheduler. `Backend` and `CpuBackend` as a module until `backend` splits | No tokenizer dependency. Ids in and out is also what tok/s benchmarks measure                                                                            |
-| `backend`                 | 6A                  | `Backend` trait, tensor type, `CpuBackend`, split from `inference` when `metal` starts                                                                                                                                                                                                                         | `inference` and `metal` depend on it, not on each other: model edits do not rebuild `metal`, Metal tests compare against `CpuBackend` without model code |
-| `harness`                 | 5                   | Context builder, tool-call parsing, tools, agent loop.                                                                                                                                                                                                       | Uses `tokenizer` and `inference`. Agent code stays out of the inference path                                                                             |
-| `metal`                   | 6A                  | `MetalBackend`                                                                                                                                                                                                                                                                                                 | `unsafe`, Metal bindings, shaders, macOS only. Depends on `backend` only                                                                                 |
-| `server`                  | 6B                  | axum handler, request channel, SSE                                                                                                                                                                                                                                                                             | Uses `tokenizer` and `inference`. Async runtime. Batching scheduler stays in `inference` (needs KV internals)                                            |
+| `inference`               | 2, 3, 4, 7A         | Ids side: safetensors loader, GPT-2 and Llama forward passes, KV cache, int8, `Session`, `Sampler`, `LogitProcessor`, `StopCondition` (byte-matched stop strings), grammar masks, generate loop (ids in, ids out), later the batching scheduler. `Backend` and `CpuBackend` as a module until `backend` splits | No tokenizer dependency. Ids in and out is also what tok/s benchmarks measure                                                                            |
+| `backend`                 | 5                   | `Backend` trait (handle-based), tensor/weight/cache types, `CpuBackend`, split from `inference` when `metal` starts                                                                                                                                                                                            | `inference` and `metal` depend on it, not on each other: model edits do not rebuild `metal`, Metal tests compare against `CpuBackend` without model code |
+| `metal`                   | 5                   | `MetalBackend` (GPU kernels, 4-bit dequantization, f16 KV cache)                                                                                                                                                                                                                                               | `unsafe`, Metal bindings, shaders, macOS only. Depends on `backend` only                                                                                 |
+| `harness`                 | 6                   | Append-only context builder, tool-call parsing, tools, evaluation suite, agent loop.                                                                                                                                                                                                                           | Uses `tokenizer` and `inference`. Agent code stays out of the inference path                                                                             |
+| `server`                  | 7A                  | axum handler, request channel, SSE                                                                                                                                                                                                                                                                             | Uses `tokenizer` and `inference`. Async runtime. Batching scheduler stays in `inference` (needs KV internals)                                            |
 | Grammar (unnamed)         | 4, only if it grows | Grammar compiler, token-mask engine                                                                                                                                                                                                                                                                            | Needs neither model nor tokenizer, like llguidance's separate [`toktrie`](https://docs.rs/toktrie)                                                       |
 | Python bindings (unnamed) | any                 | PyO3 wrapper for benchmarking (see README)                                                                                                                                                                                                                                                                     | `cdylib` and pyo3                                                                                                                                        |
 
 ```text
-            backend   (Backend trait, tensor type, CpuBackend)
+            backend   (Backend trait, tensor/cache handles, CpuBackend)
              ▲     ▲
              │     │
-     inference     metal   (stage 6, option A)
+     inference     metal   (stage 5)
              ▲
              │
 tokenizer-cli · harness · server   (encode, run inference, streaming decode)
@@ -546,28 +567,31 @@ Not planned: `engine` crate (shared text layer between `inference` and consumers
 
 Where the crate map rests on a prediction. Raise each when its stage starts, before building on it. Delete a row once it is resolved.
 
-| Stage        | Concern                                                                                                                                                                            | If it goes the other way                                                                                                                                             |
-| ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1            | Id-to-bytes table missing (stage 1 open decisions)                                                                                                                                 | Streaming decode, grammar masks, stop strings wait on it                                                                                                             |
-| 4, at start  | Does any stage 4 piece need tokenizer code, not just data? Sketch structs and signatures with `todo!()` bodies first; `cargo check` shows a missing dependency before logic exists | F's premise breaks; revisit B or E                                                                                                                                   |
-| 4            | Sampling stays a separate call after the forward pass, not inside a `Session` step                                                                                                 | Folding it in blocks the stage 6A overlap: [XGrammar](https://arxiv.org/abs/2411.15100) builds the mask on CPU during the GPU forward pass, waiting only at sampling |
-| 4            | `Session` return types are the commitment. Logits as borrowed `&[f32]`; caller can `.to_vec()`                                                                                     | Owned-to-borrowed later breaks every caller                                                                                                                          |
-| 4            | `Session` stays `Send`: compile-only `fn assert_send<T: Send>() {}` test                                                                                                           | A private `Rc` or `RefCell` drops `Send` silently; `server` breaks at stage 6                                                                                        |
-| 4, 6B        | Does `Session`'s API survive continuous batching? Stepping many sessions in one forward pass needs KV internals                                                                    | Scheduler goes in `inference`. If `Session` cannot express batching, rework before stage 5 builds on it                                                              |
-| 4            | Grammar code size                                                                                                                                                                  | Own crate if large                                                                                                                                                   |
-| 5, 6B        | Text wiring repeated in `harness` and `server`                                                                                                                                     | `engine` if past a few calls                                                                                                                                         |
-| 6A, at start | `backend` split                                                                                                                                                                    | Move `Backend`, tensor type, `CpuBackend` out of `inference` before `metal`, so `metal` never depends on model code                                                  |
+| Stage       | Concern                                                                                                                                                                            | If it goes the other way                                                                                                                                             |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1           | Id-to-bytes table missing (stage 1 open decisions)                                                                                                                                 | Streaming decode, grammar masks, stop strings wait on it                                                                                                             |
+| 4, at start | Does any stage 4 piece need tokenizer code, not just data? Sketch structs and signatures with `todo!()` bodies first; `cargo check` shows a missing dependency before logic exists | The tokenizer-free split breaks; revisit adding a `tokenizer` dependency or an `engine` crate                                                                        |
+| 4           | Sampling stays a separate call after the forward pass, not inside a `Session` step                                                                                                 | Folding it in blocks the stage 5 overlap: [XGrammar](https://arxiv.org/abs/2411.15100) builds the mask on CPU during the GPU forward pass, waiting only at sampling  |
+| 4           | `Session` return types are the commitment. Logits as reusable `&mut [f32]` owned by `Session`; processors edit in place and callers can `.to_vec()`                                | Owned-to-borrowed later breaks every caller; `&[f32]` forces a 608 KiB copy per token before `LogitProcessor` runs                                                   |
+| 4           | `Session` stays `Send`: compile-only `fn assert_send<T: Send>() {}` test                                                                                                           | A private `Rc` or `RefCell` drops `Send` silently; `server` breaks at stage 7A                                                                                       |
+| 4, 7A       | Does `Session`'s API survive continuous batching? Stepping many sessions in one forward pass needs KV internals                                                                    | Scheduler goes in `inference`. If `Session` cannot express batching, rework before stage 6 builds on it                                                              |
+| 4           | Grammar code size                                                                                                                                                                  | Own crate if large                                                                                                                                                   |
+| 4           | `KvCache` rollback and cloning (`truncate(len)`, `Clone`)                                                                                                                          | Append-only cache blocks single-user prefix reuse across stage 6 coding turns, forked worker sessions, and speculative rollback without adding paged blocks          |
+| 4           | `Session` returning logits for all `k` new tokens on demand, not only the last row                                                                                                 | Speculative verification (such as Prompt Lookup Decoding) needs logits at every verified position in one pass                                                        |
+| 4           | Grammar jump-forward hook (optional forced byte run outside `LogitProcessor`)                                                                                                      | Mask-only `LogitProcessor` decodes fixed tool-call syntax one token at a time instead of prefilling forced runs in one shot                                          |
+| 5, at start | `backend` split and handle-based `Backend` redesign (`type Tensor`, `type Weight`, `type Cache`)                                                                                   | Keeping today's `&[f32] -> Vec<f32>` trait forces ~200 Metal command-buffer submissions and host syncs per token, making GPU slower than CPU                         |
+| 6, 7A       | Text wiring repeated in `harness` and `server`                                                                                                                                     | `engine` if past a few calls                                                                                                                                         |
 
 ---
 
 ## Cross-stage constraints
 
-| Constraint                                                                                                                                       | Set in  | Pays off in       | Why                                                                  |
-| ------------------------------------------------------------------------------------------------------------------------------------------------ | ------- | ----------------- | -------------------------------------------------------------------- |
-| Tensor ops (matmul, RMSNorm, RoPE, softmax, attention) behind `Backend` trait. CPU path stays correctness reference (logits within ~1e-4 of HF). | Stage 2 | Stage 6 (Metal)   | GPU backend must be swappable and checkable against CPU one.         |
-| `Session` supports many concurrent sessions from start.                                                                                          | Stage 4 | Stage 6 (serving) | Cheap now, rewrite later.                                            |
-| Tokenizer takes vocabulary, merges, pre-tokenizer pattern as data, not constants.                                                                | Stage 1 | Stage 3           | Llama 3 and Qwen ship own.                                           |
-| Tokenizer exposes id-to-bytes table and streaming-safe decode.                                                                                   | Stage 1 | Stages 4, 5, 6    | Grammar masks, stop strings, SSE streaming all work on partial text. |
-| Reference tokenizers and models = test oracles only, never in code path under test.                                                              | All     | All               | Keeps from-scratch rule honest.                                      |
-| `inference` never depends on `tokenizer`; takes id-to-bytes table and end-of-sequence id as data.                                                | Stage 2 | Stages 4, 6A      | Tokenizer edits never rebuild model or `metal`.                      |
-| Sampling is a separate call after the forward pass.                                                                                              | Stage 4 | Stage 6A          | CPU builds grammar mask during GPU forward pass.                     |
+| Constraint                                                                                                                                       | Set in  | Pays off in       | Why                                                                                                 |
+| ------------------------------------------------------------------------------------------------------------------------------------------------ | ------- | ----------------- | --------------------------------------------------------------------------------------------------- |
+| Tensor ops (matmul, RMSNorm, RoPE, softmax, attention) behind `Backend` trait. CPU path stays correctness reference (logits within ~1e-4 of HF). | Stage 2 | Stage 5 (Metal)   | GPU backend must be swappable and checkable against CPU one (trait moves to device handles in 5).   |
+| `Session` supports many concurrent sessions, incremental delta prefill, and `truncate` from start.                                               | Stage 4 | Stages 6, 7       | Prefix reuse across coding turns, forked workers, serving, and speculative rollback without rewrite.|
+| Tokenizer takes vocabulary, merges, pre-tokenizer pattern as data, not constants.                                                                | Stage 1 | Stage 3           | Llama 3 and Qwen ship own.                                                                          |
+| Tokenizer exposes id-to-bytes table, streaming-safe decode, and `allowed_special` policy before untrusted input.                                 | Stage 1 | Stages 4, 6, 7    | Grammar masks, stop strings, SSE streaming, and safe tool-output tokenization.                      |
+| Reference tokenizers and models = test oracles only, never in code path under test.                                                              | All     | All               | Keeps from-scratch rule honest.                                                                     |
+| `inference` never depends on `tokenizer`; takes id-to-bytes table and end-of-sequence id as data.                                                | Stage 2 | Stages 4, 5       | Tokenizer edits never rebuild model or `metal`.                                                     |
+| Sampling is a separate call after the forward pass.                                                                                              | Stage 4 | Stage 5           | CPU builds grammar mask during GPU forward pass.                                                    |
