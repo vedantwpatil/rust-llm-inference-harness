@@ -208,8 +208,10 @@ fn main() {
     let mut cache = model.new_cache();
     let mut logits = model.forward(&ids, &mut cache);
     let mut steps = Vec::new();
+    let mut generated = Vec::new();
     for _ in 0..NEW_TOKENS {
         let next = argmax(&logits);
+        generated.push(next);
         let start = Instant::now();
         logits = model.forward(&[next], &mut cache);
         steps.push(start.elapsed().as_secs_f64());
@@ -252,5 +254,9 @@ fn main() {
         roofline,
         100.0 * (1.0 / step_s) / roofline
     );
+    // `scripts/compare.py` reads these to give other engines the same prompt
+    // and to check that they generate the same tokens.
+    println!("prompt               {PROMPT}");
+    println!("greedy ids           {:?}", &generated[..16]);
     breakdown(&*model, &secs, &shapes, &ids);
 }

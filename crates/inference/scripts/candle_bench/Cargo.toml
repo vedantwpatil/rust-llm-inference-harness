@@ -1,0 +1,16 @@
+[package]
+name = "candle_bench"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+# Its own workspace: candle is a comparison target, not a dependency of the project.
+[workspace]
+
+[dependencies]
+candle-core = "=0.11.1"
+candle-transformers = "=0.11.1"
+
+[profile.release]
+lto = true
+codegen-units = 1
