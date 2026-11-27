@@ -165,28 +165,59 @@ impl<B: Backend> Llama<B> {
         }
         note(&mut trace, "embed", &x);
 
+        let last_layer = self.layers.len() - 1;
         for (l, layer) in self.layers.iter().enumerate() {
             let h = b.rmsnorm(&x, &layer.attn_norm, c.rms_eps);
             note(&mut trace, format!("block{l}.ln_1"), &h);
 
-            let qkv = b.matmul(&h, t, &layer.qkv, layer.qkv_bias.as_deref());
-            let [mut q, mut k, v]: [Vec<f32>; 3] = split_columns(&qkv, &[q_dim, kv_dim, kv_dim])
-                .try_into()
-                .unwrap();
-            b.rope(&mut q, pos0, c.n_heads, c.head_dim, &self.inv_freq);
-            b.rope(&mut k, pos0, c.n_kv_heads, c.head_dim, &self.inv_freq);
-            cache.append(l, &k, &v);
-            let (all_k, all_v) = &cache.layers[l];
-            let a = b.attention(&q, all_k, all_v, shape);
-            let a = b.matmul(&a, t, &layer.o_proj, None);
+            let mut qkv = b.matmul(&h, t, &layer.qkv, layer.qkv_bias.as_deref());
+            // On the last layer of a non-traced prefill, every token's keys and
+            // values must still populate the cache, but only the last token's
+            // hidden state is needed for logits.
+            let prune_last = l == last_layer && t > 1 && trace.is_none();
+            let (t_out, a) = if t == 1 {
+                // `qkv` is already `[q | k | v]` contiguously: rotate in place
+                // without allocating three separate vectors.
+                let (q, kv) = qkv.split_at_mut(q_dim);
+                let (k, v) = kv.split_at_mut(kv_dim);
+                b.rope(q, pos0, c.n_heads, c.head_dim, &self.inv_freq);
+                b.rope(k, pos0, c.n_kv_heads, c.head_dim, &self.inv_freq);
+                cache.append(l, k, v);
+                let (all_k, all_v) = &cache.layers[l];
+                (1, b.attention(q, all_k, all_v, shape))
+            } else {
+                let [mut q, mut k, v]: [Vec<f32>; 3] = split_columns(&qkv, &[q_dim, kv_dim, kv_dim])
+                    .try_into()
+                    .unwrap();
+                b.rope(&mut k, pos0, c.n_kv_heads, c.head_dim, &self.inv_freq);
+                cache.append(l, &k, &v);
+                let (all_k, all_v) = &cache.layers[l];
+                if prune_last {
+                    let q_last = &mut q[(t - 1) * q_dim..];
+                    b.rope(q_last, pos0 + t - 1, c.n_heads, c.head_dim, &self.inv_freq);
+                    let last_shape = AttnShape {
+                        t: 1,
+                        pos0: pos0 + t - 1,
+                        ..shape
+                    };
+                    (1, b.attention(q_last, all_k, all_v, last_shape))
+                } else {
+                    b.rope(&mut q, pos0, c.n_heads, c.head_dim, &self.inv_freq);
+                    (t, b.attention(&q, all_k, all_v, shape))
+                }
+            };
+            if prune_last {
+                x.drain(..(t - 1) * c.hidden);
+            }
+            let a = b.matmul(&a, t_out, &layer.o_proj, None);
             note(&mut trace, format!("block{l}.attn"), &a);
             add_in_place(&mut x, &a);
 
             let h = b.rmsnorm(&x, &layer.mlp_norm, c.rms_eps);
             note(&mut trace, format!("block{l}.ln_2"), &h);
-            let m = b.matmul(&h, t, &layer.gate_up, None);
+            let m = b.matmul(&h, t_out, &layer.gate_up, None);
             let m = b.swiglu(&m, c.intermediate);
-            let m = b.matmul(&m, t, &layer.down, None);
+            let m = b.matmul(&m, t_out, &layer.down, None);
             note(&mut trace, format!("block{l}.mlp"), &m);
             add_in_place(&mut x, &m);
             note(&mut trace, format!("block.{l}"), &x);

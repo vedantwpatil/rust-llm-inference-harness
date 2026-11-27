@@ -111,27 +111,52 @@ impl<B: Backend> Gpt2<B> {
         let mut x = embed(self.wte.f32(), &self.wpe[pos0 * w..], ids, w);
         note(&mut trace, "embed", &x);
 
+        let last_block = self.blocks.len() - 1;
         for (l, blk) in self.blocks.iter().enumerate() {
             let h = b.layernorm(&x, &blk.ln_1.0, &blk.ln_1.1, EPS);
             note(&mut trace, format!("block{l}.ln_1"), &h);
 
             // c_attn fuses query, key, value: each row is [q | k | v], w wide each.
             let qkv = b.matmul(&h, t, &blk.c_attn, Some(&blk.c_attn_bias));
-            let [q, k, v] = &split_columns(&qkv, &[w; 3])[..] else {
-                unreachable!()
+            // On the last block of a non-traced prefill, every token's keys and
+            // values must still populate the cache, but only the last token's
+            // hidden state is needed for logits.
+            let prune_last = l == last_block && t > 1 && trace.is_none();
+            let (t_out, a) = if t == 1 {
+                let (q, kv) = qkv.split_at(w);
+                let (k, v) = kv.split_at(w);
+                cache.append(l, k, v);
+                let (all_k, all_v) = &cache.layers[l];
+                (1, b.attention(q, all_k, all_v, shape))
+            } else {
+                let [q, k, v] = &split_columns(&qkv, &[w; 3])[..] else {
+                    unreachable!()
+                };
+                cache.append(l, k, v);
+                let (all_k, all_v) = &cache.layers[l];
+                if prune_last {
+                    let last_shape = AttnShape {
+                        t: 1,
+                        pos0: pos0 + t - 1,
+                        ..shape
+                    };
+                    (1, b.attention(&q[(t - 1) * w..], all_k, all_v, last_shape))
+                } else {
+                    (t, b.attention(q, all_k, all_v, shape))
+                }
             };
-            cache.append(l, k, v);
-            let (all_k, all_v) = &cache.layers[l];
-            let a = b.attention(q, all_k, all_v, shape);
-            let a = b.matmul(&a, t, &blk.attn_proj, Some(&blk.attn_proj_bias));
+            if prune_last {
+                x.drain(..(t - 1) * w);
+            }
+            let a = b.matmul(&a, t_out, &blk.attn_proj, Some(&blk.attn_proj_bias));
             note(&mut trace, format!("block{l}.attn"), &a);
             add_in_place(&mut x, &a);
 
             let h = b.layernorm(&x, &blk.ln_2.0, &blk.ln_2.1, EPS);
             note(&mut trace, format!("block{l}.ln_2"), &h);
-            let mut m = b.matmul(&h, t, &blk.c_fc, Some(&blk.c_fc_bias));
+            let mut m = b.matmul(&h, t_out, &blk.c_fc, Some(&blk.c_fc_bias));
             b.gelu(&mut m);
-            let m = b.matmul(&m, t, &blk.mlp_proj, Some(&blk.mlp_proj_bias));
+            let m = b.matmul(&m, t_out, &blk.mlp_proj, Some(&blk.mlp_proj_bias));
             note(&mut trace, format!("block{l}.mlp"), &m);
             add_in_place(&mut x, &m);
             note(&mut trace, format!("block.{l}"), &x);

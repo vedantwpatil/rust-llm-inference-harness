@@ -113,11 +113,11 @@ On one core with data in cache `4,4,1` reaches about 113 GFLOP/s (the core's cei
 | rayon, 8-accumulator `dot`                       | 705                | 121               | about 50%                |
 | spinning pool, tiled NEON kernels                | about 1200         | about 177         | 75%                      |
 | plus parallel `gelu` and transpose               | about 2600         | about 185 to 193  | about 75%                |
-| plus the [performance-ceiling work](#performance-ceiling), prefill on 10 threads | about 3800 | about 215 | about 85% |
+| plus the [performance-ceiling work](#performance-ceiling), prefill on 10 threads | about 4380 | about 225 | about 90% |
 
-Prefill is about 440 GFLOP/s (17.5 GFLOP for the prompt in about 40 ms). Decode matmul runs at about 107 GB/s of the roughly 120 GB/s probe, so what is left of the gap to the roofline is spread thin: `gelu` and attention take about 0.3 ms each of 5.3 ms, and each parallel region still pays a small wake-up and join cost.
+Prefill reaches roughly 750 billion floating-point operations per second (17.5 billion operations for the prompt in about 23.5 milliseconds). Decode matrix multiplication runs near 120 to 124 gigabytes per second on large matrices against a 124 to 127 gigabytes per second probe, leaving roughly 0.4 milliseconds per token spread across small-matrix overhead, attention (0.21 milliseconds), normalizations, activations, and residual additions.
 
-**Not done.** The residual adds are serial. Every `Backend` call allocates a fresh `Vec` for its output.
+**Not done.** The residual additions are serial. Every `Backend` call allocates a fresh `Vec` for its output (though large prefill outputs skip single-thread zero-filling and fault pages in parallel).
 
 ## Stage 3: a Llama-style model and int8
 
@@ -140,15 +140,15 @@ Query, key and value are one `[q_dim + 2 * kv_dim, hidden]` matrix and gate and 
 
 ### Int8
 
-Weights are symmetric int8 with one scale per output row (`scale = max|row| / 127`). A matmul against them rounds its activations to int8 as well, one scale per `Q8_BLOCK` (128) values of a token, so the inner loop is the integer dot product `sdot`: 16 multiply-adds per instruction, four times an f32 fused multiply-add, with no widening first. The row scale is applied once per output; the activation scales are the ones that matter for accuracy. A scale per whole token let one outlier channel flatten the rest and cost 2.5 points of top-1 agreement with float32, and a scale per block confines it.
+Weights are symmetric 8-bit integers with one scale per output row (`scale = max|row| / 127`). A matrix multiplication against them rounds its activations to 8-bit integers as well, one scale per `Q8_BLOCK` (128) values of a token. On processors with ARMv8.6 integer matrix multiply (`i8mm`, checked at runtime), the inner loop uses `smmla` (2-by-8 by 8-by-2 matrix multiply-accumulate, 32 multiply-adds per instruction with no pairwise horizontal reduction epilogue); on older 64-bit ARM processors it falls back to `sdot` (16 multiply-adds per instruction). The row scale is applied once per output; the activation scales are the ones that matter for accuracy. A scale per whole token let one outlier channel flatten the rest and cost 2.5 points of top-1 agreement with 32-bit floating-point, and a scale per block confines it.
 
-**What it costs in accuracy.** `eval_int8` over 512 tokens of three different files from this repository (Rust, Rust, prose): 97.1% to 97.5% of positions have the same top-1 token as float32 and perplexity rises by 0.14% to 0.77%. Weight-only int8 had measured 98.2% and 0.30% on the first of them, so rounding activations costs about a point of agreement. Logits on the verification prompt are within `1.5e-2` of Hugging Face's, relative to the logits' scale. With the top token different at about 1 position in 35, greedy output eventually diverges from float32's; that is the expected shape of quantization error, which is why the `1e-4` bar does not apply.
+**What it costs in accuracy.** `eval_int8` over 512 tokens of `crates/tokenizer/src/tokenizer.rs`: 97.7% of positions (499 of 511) pick the same top-1 token as 32-bit floating-point and perplexity rises by 0.38% (12.414 to 12.461). Across other repository files earlier checks stayed within 97.1% to 97.5% agreement and 0.14% to 0.77% perplexity rise. Weight-only 8-bit integer had measured 98.2% and 0.30% on the first file, so rounding activations costs about a point of agreement. Logits on the verification prompt are within `1.5e-2` of Hugging Face's, relative to the logits' scale. With the top token different at roughly 1 position in 40, greedy output eventually diverges from 32-bit floating-point; that is the expected shape of quantization error, which is why the `1e-4` bar does not apply.
 
-**What it buys.** Weight bytes per token fall from 1976 MB to 496 MB, and decode from 55 to about 205 tokens/s, 3.7 times for 4 times fewer bytes. Prefill is compute-bound and also gains, from 1000 to about 2500 tokens/s, since `sdot` does four times the work per instruction ([Speed](#speed)).
+**What it buys.** Weight bytes per token fall from 1976 megabytes to 496 megabytes, and decode rises from 57 to about 225 tokens per second — 3.95 times faster for 4 times fewer bytes. Prefill is compute-bound and rises from about 1120 to about 3600 to 3730 tokens per second, roughly 3.3 times faster.
 
-**Packed layout.** A tile of four weight rows against one activation row reads four streams `k` bytes apart. One thread pulled that from memory at 29 to 68 GB/s depending on `k`, and the same bytes at 91 to 94 GB/s when the four rows of each block sit next to each other. So int8 weights are stored in groups of four rows, block by block (`packed_index`, `Matrix::q8_index`), and rows after the last whole group stay plain. The float32 layout is unchanged.
+**Packed layout.** A tile of multiple weight rows against one activation row would otherwise read separate streams `k` bytes apart. One thread pulled four plain streams from memory at 29 to 68 gigabytes per second depending on `k`, versus 91 to 94 gigabytes per second packed. With `i8mm`, 8-bit integer weights are stored in groups of 8 rows (`packed_index_smmla8`, 1024 contiguous bytes per 128-element block); without `i8mm`, they pack in groups of 4 rows (`packed_index`). Leftover rows after the last whole group stay plain. The 32-bit floating-point layout is unchanged.
 
-**What stays float32.** Norm weights and biases (tiny, and their error is not averaged away by a dot product), the activations between ops, and the KV cache. The token embedding table is quantized; the tied output projection reads the same matrix, and it is the largest tensor (136M of the 494M parameters).
+**What stays float32.** Normalization weights and biases (tiny, and their error is not averaged away by a dot product), the activations between operations, and the key and value cache. The token embedding table is quantized; the tied output projection reads the same matrix, and it is the largest tensor (136 million of the 494 million parameters).
 
 ### Tokenizer as data
 
@@ -156,58 +156,59 @@ Weights are symmetric int8 with one scale per output row (`scale = max|row| / 12
 
 ### Speed
 
-Same roofline as stage 2: `bandwidth / (weight bytes + KV bytes)`. Prefill pushes 101 tokens through 358M matrix-multiplied parameters (the embedding table is only read for the last row): 72 Gop for the layers. Prefill tokens/s is lower than GPT-2's because each token costs 4 times the arithmetic.
+Same roofline as stage 2: `bandwidth / (weight bytes + key and value cache bytes)`. Prefill pushes 101 tokens through 358 million matrix-multiplied parameters (the embedding table is only read for the last row): 72 billion operations for the layers. Prefill tokens per second is lower than GPT-2's because each token costs 4 times the arithmetic.
 
-| 10 performance cores, decode on 8        | Prefill (tokens/s) | Decode (tokens/s) | Decode share of its roofline |
-| ---------------------------------------- | ------------------ | ----------------- | ---------------------------- |
-| GPT-2, float32, 103 tokens               | about 3800         | about 215         | about 85%                    |
-| Qwen2.5-Coder-0.5B, float32, 101 tokens  | about 1000         | about 56          | about 86%                    |
-| Qwen2.5-Coder-0.5B, int8, 101 tokens     | about 2500         | about 205         | about 80%                    |
+| Standalone wall-power run (10 performance cores, decode up to 8) | Prefill (tokens/s) | Decode (tokens/s) | Decode share of its roofline |
+| ---------------------------------------------------------------- | ------------------ | ----------------- | ---------------------------- |
+| GPT-2, 32-bit floating-point, 103 tokens                         | about 4380         | about 225         | about 90%                    |
+| Qwen2.5-Coder-0.5B, 32-bit floating-point, 101 tokens            | about 1120 to 1150 | about 57          | about 88% to 90%             |
+| Qwen2.5-Coder-0.5B, 8-bit integer, 101 tokens                    | about 3600 to 3730 | about 225         | about 89% to 90%             |
 
-Comparison with llama.cpp and mlx-lm is not done: neither is installed here.
+Head-to-head on Qwen2.5-Coder-0.5B across 3 alternating rounds on wall power (`crates/inference/scripts/compare.py`, median and min to max tokens per second; all 16 greedy 32-bit floating-point tokens match across all three engines). Note that on macOS Homebrew's `llama.cpp` still routes 32-bit floating-point prefill through Apple Accelerate even with Metal disabled, while this engine and `candle` run pure CPU NEON.
+
+| Weights               | Engine      | Prefill                        | Decode                      |
+| --------------------- | ----------- | ------------------------------ | --------------------------- |
+| 32-bit floating-point | this engine | 928 (819 to 1118)              | 58 (57 to 58)               |
+| 32-bit floating-point | llama.cpp   | 1108 (1067 to 1109, 6 threads) | 57 (54 to 58, 10 threads)   |
+| 32-bit floating-point | candle      | 451 (442 to 454, 8 threads)    | 25 (25 to 25, 6 threads)    |
+| 8-bit integer         | this engine | 2934 (2125 to 3467)            | 212 (180 to 221)            |
+| 8-bit integer         | llama.cpp   | 1554 (1463 to 1668, 8 threads) | 189 (184 to 191, 8 threads) |
+| 8-bit integer         | candle      | 812 (799 to 836, 8 threads)    | 131 (128 to 147, 6 threads) |
 
 ### Performance ceiling
 
-Each number below is measured, not estimated: `ceilings` times register-only loops and memory streaming on this chip, `bench` times the model, and the gap between them is accounted for. The `bench` breakdown prints milliseconds per op and, for decode, GB/s per matmul shape.
+Each number below is measured on wall power, not estimated: `ceilings` times register-only loops and memory streaming on this chip, `bench` times the model, and the gap between them is accounted for. The `bench` breakdown prints milliseconds per operation and, for decode, gigabytes per second per matrix shape.
 
-| Limit (M3 Max)                       | Measured                                                                                           |
-| ------------------------------------ | -------------------------------------------------------------------------------------------------- |
-| Memory read, 2 or more threads       | 125 to 128 GB/s (one thread: 83)                                                                   |
-| float32 fused multiply-add           | 120 Gop/s per thread, 1140 on 10                                                                   |
-| int8 `sdot`                          | 481 Gop/s per thread, 4570 on 10 (95% scaling). `smmla` measures the same, so it buys nothing      |
-| One cold slice streamed per region   | 0.8 MB: 59 to 78 GB/s, 1 MB: 66 to 100, 4.4 MB: 103 to 117, 8.8 MB: 110 to 123 (4 to 10 threads) |
-| Empty parallel region                | 0.3 µs on 4 threads, 2.8 on 8, 3.3 on 10                                                           |
+| Limit (Apple M3 Max, wall power)     | Measured                                                                                              |
+| ------------------------------------ | ----------------------------------------------------------------------------------------------------- |
+| Memory read, 2 or more threads       | 123 to 128 gigabytes per second (one thread: 83 to 86)                                                |
+| 32-bit floating-point fused multiply-add | 121 billion operations per second per thread, 1130 on 10                                          |
+| 8-bit integer `sdot` / `smmla`       | 472 to 480 billion operations per second per thread, 4560 to 4570 on 10 (95% scaling)                 |
+| One cold slice streamed per region   | 0.8 MB: 66 to 101 GB/s, 1 MB: 90 to 104, 4.4 MB: 93 to 119, 8.8 MB: 100 to 122 (4 to 10 threads)      |
+| Empty parallel region                | 0.58 µs on 2 threads, 0.59 on 4, 0.69 on 6, 0.78 on 8, 0.89 on 10                                     |
 
-**Decode, Qwen int8: 5.0 ms per token against 3.9 ms at the roofline.** The 1.1 ms gap is three parts.
+**Decode, Qwen 8-bit integer: 4.43 milliseconds per token against 3.97 milliseconds at the roofline (89% to 90%).** The 0.46-millisecond gap is two parts:
 
-- About 0.5 ms is the small matrices. A region streaming under about 4 MB does not reach full bandwidth however it is cut (the cold-slice rows above): the attention output projection is 0.8 MB and measures 57 GB/s, the fused query, key and value projection is 1.0 MB and measures 74. Summing every shape at the rate the probe gives for its size on 8 threads (70, 79, 115, 120 and 125 GB/s) puts the matmuls at 4.35 ms, against 3.9 ms at full bandwidth.
-- About 0.1 ms is the matmuls over their own ceilings, 4.48 ms measured against 4.35: task tails and uneven task sizes. The large shapes are at their rate: 118 GB/s for the 8.8 MB feed-forward matrix and 124 for the 137 MB logits projection.
-- About 0.5 ms is everything that is not a matmul: attention 0.30 (24 regions of 14 heads, about 12 µs each, 3 µs of it the region itself), then norms, `swiglu`, `rope` and the residual adds.
+- About 0.15 milliseconds is the small matrices. Even with the lock-free pool and static 6-thread splitting, a 0.8-megabyte attention output projection streams at 99 to 103 gigabytes per second and a 1.0-megabyte fused query, key, and value projection at 102 to 105 gigabytes per second, right at the cold-slice ceiling (101 to 104 gigabytes per second). Large matrices sit right on the memory ceiling: 118 to 122 gigabytes per second for the 8.8-megabyte feed-forward matrix and 121 to 124 gigabytes per second for the 137-megabyte logits projection.
+- About 0.35 milliseconds is everything that is not a matrix multiplication: attention 0.12 milliseconds (parallelized across all 14 query heads with stack score buffers and register-resident value accumulation), Swish-gated linear unit 0.07, root mean square normalization 0.02, rotary position embedding 0.01, and residual additions plus buffer allocation 0.13.
 
-Float32 Qwen and GPT-2 decode are the same story at 86% and 85% of their roofline.
+32-bit floating-point Qwen (88% to 90% of roofline) and GPT-2 (90% of roofline) show the same profile.
 
-**Prefill, Qwen int8: 40 ms for 101 tokens.**
+**Prefill, Qwen 8-bit integer: 27 to 28 milliseconds for 101 tokens (3600 to 3730 tokens per second).**
 
-| Step                                                   | Time for the 72 Gop of layer matmuls |
-| ------------------------------------------------------ | ------------------------------------ |
-| `sdot` peak on 10 threads                              | 15.8 ms                              |
-| the 4 by 4 tile on 10 threads, operands in L1          | 25.9 ms (280 Gop/s per thread)       |
-| measured, `CpuBackend::matmul`                         | 32.6 ms (2220 Gop/s)                 |
+- Matrix multiplication takes 24.2 to 25.0 milliseconds total (about 1.1 milliseconds for the memory-bound logits projection, and 23.1 to 23.9 milliseconds for the 72 billion operations across the 24 layers — roughly 3000 billion operations per second, or 66% of the raw register-only `smmla` ceiling including activation quantization, packing, per-block float conversion and scaling, and writing uninitialized output memory).
+- Why `smmla` won despite equal raw register peak to `sdot`: an 8-by-8 `smmla` tile computes 64 outputs in 16 accumulators with zero pairwise horizontal additions (`addp`), uses all 32 vector registers with double-buffered loads and zero stack spills, and pairs with fused single-pass quantization and packing (`quantize_block`) into a reusable scratch buffer (`q8_scratch`). Together with removing per-task temporary allocations and pruning the final layer to only the last token after updating the cache, 8-bit integer prefill matrix multiplication fell from 35.9 to 24.2 milliseconds.
+- The rest of the 28 milliseconds: tiled 4-by-4 prefill attention 1.23 milliseconds, Swish-gated linear unit 0.93 to 1.13 milliseconds (4-vector Estrin exponential and Newton-Raphson reciprocal), root mean square normalization 0.47 to 0.57 milliseconds, cached rotary position embedding 0.17 milliseconds, and copies plus residual additions 1.15 milliseconds.
 
-- Peak to tile: a 4 by 4 tile does 128 `sdot` per block of 128 values, and with them 64 loads and about 36 other vector instructions: zeroing the 16 int32 sums, 12 pairwise adds that collapse each token's four row sums into one vector, 4 conversions and 4 multiply-adds that apply the block's scale. A loads-and-`sdot`-only tile reaches 386 Gop/s per thread, so the per-block scale (which is what the accuracy needs) costs a fifth to a quarter.
-- Tile to measured: 87 to 89% on the large matrices (2430 to 2480 Gop/s) and 56 to 61% on the two small ones (1560 and 1720). A matmul is three regions (quantize the scales, quantize the values, multiply), 56 to 72 tasks of 16 rows on 10 threads leave a tail, and a 100 µs call has little room for either.
-- The rest of the 40 ms: the logits projection 1.1 ms (memory-bound, 124 GB/s), attention 2.6, `swiglu` 1.6 (11.8M `exp` and divisions), `rmsnorm` 0.5, `rope` 0.7, copies and residual adds 1.1. Attention scales to about three quarters of linear on 8 threads. Claiming a task costs about 120 ns on the shared counter and 14 (query, head) pairs per task is the flat optimum, so the rest is per-item cost.
-
-**What got it here.** A vectorized `exp`; parallel norms, `rope` and attention with tasks sized by the data they cover (a task shorter than the ~120 ns it costs to claim slows its region down); matmul strips written straight into the result in place of a `[n_out][t]` transpose; the lane-adding epilogue in `tile_q8` (with an accumulator per output the tile needs more than the 32 vector registers and spills); prefill on every performance core.
+**What got it here.** A lock-free zero-allocation `Pool` (single atomic `(epoch, width)` dispatch, cache-line-aligned per-worker completion slots, interactive quality-of-service pinning on macOS worker threads); static splitting for small decode matrices and large contiguous dynamic chunks for big ones; `smmla` 8-by-8 prefill and 8-by-1 decode kernels with fused single-pass NEON block quantization; direct tile writes into uninitialized output memory; 4-vector unrolled NEON activations and 4-accumulator layer normalization; cached rotary position embedding tables; tiled 4-by-4 prefill attention with register-resident value accumulation and split-key long-context decode attention; zero-copy single-token query, key, and value slicing; and final-layer prefill pruning when not tracing.
 
 **Tried and dropped.**
 
-- `smmla` for `sdot`: the same Gop/s, with a repacking cost.
 - `sdot` by element: needs 16 independent accumulators to cover its latency at 4 per cycle, which brings back the epilogue adds.
-- A scale per token instead of per block: 2.5 points of top-1 agreement.
-- Blocks of 256 values: the tile measured slower, 322 against 352 Gop/s per thread at `k = 4864` where no short tail block is involved.
+- Hand-written spill-free 4-by-4 `sdot` assembly: Apple M3's out-of-order store forwarding hides compiler spills in LLVM's fully unrolled `tile_q8::<4, 4>`, so `smmla` 8-by-8 was the real win over `sdot`.
+- A scale per token instead of per block: costs 2.5 points of top-1 agreement.
+- Blocks of 256 values: slower in cache than 128-value blocks (322 against 352 billion operations per second per thread at `k = 4864`).
 - Software prefetch from the calling thread: slower, since `prfm` stalls once the miss queue is full.
-- Tasks that claim a fixed number of rows instead of bytes in decode: 14 KB tasks reach 80 GB/s, 256 KB ones about 105.
-- Thread priority classes: no change in any ceiling.
+- Static single-slab partitioning across all 10 performance cores on macOS: any single OS preemption stalls all other threads at the barrier; capping decode at 8 threads with large dynamic chunks (and sizing short elementwise passes to buffer size) keeps bandwidth high without straggler spikes.
 
-**Left, each with its bound.** Weight prefetch from a background thread with a redesigned pool: at most 5% of decode. Packing the float32 layout the way int8 is: at most 3% of float32 decode, and a large change. Fusing activation quantization into the op before it: about 1 ms of prefill. A prefill-specific attention kernel: about 0.8 ms. None is a missing piece of understanding, each is a few percent, and what is left is the shape of the memory system and the instruction mix, not the code. Further than this on one chip needs the GPU, which is the Metal stage in [ROADMAP.md](ROADMAP.md).
+**Left, each with its bound.** Pre-packed 32-bit floating-point weights for a 12-by-8 prefill microkernel: about 10% on 32-bit floating-point prefill at the cost of a second layout and double load work (and <= 3% on decode). Half-precision key and value cache: halves attention memory traffic at long contexts (1024+ tokens), negligible at 100 tokens. Further than this on one chip requires the GPU, which is the Metal stage in [ROADMAP.md](ROADMAP.md).

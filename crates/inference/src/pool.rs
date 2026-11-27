@@ -6,6 +6,7 @@
 //! atomic for a while before they sleep: starting a region is a handful of
 //! atomic operations when the pool is busy.
 
+use std::cell::UnsafeCell;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::*};
 use std::sync::{Arc, Condvar, Mutex};
@@ -17,91 +18,83 @@ use std::time::{Duration, Instant};
 /// anything a caller does between tokens.
 const SPIN: Duration = Duration::from_micros(200);
 
-/// One parallel region: calls `f(i)` once for every `i` in `0..n_tasks`.
-struct Job {
-    /// The caller's closure with its lifetime erased; see the safety comment in
-    /// `Job::work`.
-    f: *const (dyn Fn(usize) + Sync),
-    n_tasks: usize,
-    /// Threads that may work on it, the caller included.
-    width: usize,
-    /// Next task index nobody has claimed.
-    next: AtomicUsize,
-    /// Tasks that have finished running.
-    done: AtomicUsize,
+/// Pads a field to Apple Silicon's 128-byte cache line so hot atomics written
+/// by different threads do not share a line.
+#[repr(align(128))]
+struct CacheAligned<T>(T);
+
+type RegionFn = *const (dyn Fn(usize, usize) + Sync);
+
+fn noop_region(_: usize, _: usize) {}
+
+/// Read by every worker when a region starts; written only by the caller
+/// between regions while holding `Pool::run_lock`.
+struct Dispatch {
+    /// Upper 56 bits: monotonically increasing region epoch.
+    /// Lower 8 bits: participating thread count (`width <= 64`).
+    state: AtomicU64,
+    /// Closure for the current region with its lifetime erased; see safety
+    /// comments in `Pool::run_threads` and `worker`.
+    job: UnsafeCell<RegionFn>,
+    shutdown: AtomicBool,
+}
+
+/// Cold sleep/wake state and rare panic flag, kept off `Dispatch`'s cache line.
+struct Sleep {
+    /// Bit `id` is set while worker `id` sleeps (or is entering sleep) on `wake`.
+    sleeping: AtomicU64,
+    lock: Mutex<()>,
+    wake: Condvar,
     panicked: AtomicBool,
 }
 
-// SAFETY: `f` points at a `Sync` closure and is only dereferenced under the
-// conditions in `Job::work`; every other field is atomic.
-unsafe impl Send for Job {}
-unsafe impl Sync for Job {}
-
-impl Job {
-    /// Claims and runs tasks until none are left.
-    fn work(&self) {
-        loop {
-            let i = self.next.fetch_add(1, Relaxed);
-            if i >= self.n_tasks {
-                return;
-            }
-            // SAFETY: `i < n_tasks` means this task is not done yet, so
-            // `done < n_tasks`, and `Pool::run` (which owns the closure) does
-            // not return before `done == n_tasks`. A thread holding a stale job
-            // always fails the check above, so it never reaches this line.
-            let f = unsafe { &*self.f };
-            // A panic must not unwind out of here: `run` would return early
-            // and free the closure while other threads still run it.
-            if catch_unwind(AssertUnwindSafe(|| f(i))).is_err() {
-                self.panicked.store(true, Relaxed);
-            }
-            self.done.fetch_add(1, Release);
-        }
-    }
-}
-
-struct State {
-    generation: usize,
-    job: Option<Arc<Job>>,
-}
-
 struct Shared {
-    state: Mutex<State>,
-    /// Mirror of `State::generation`, so a spinning worker can poll without
-    /// taking the lock.
-    generation: AtomicUsize,
-    /// Threads taking part in the current region, the caller included: workers
-    /// `1..width` join, the rest skip it without touching the lock.
-    width: AtomicUsize,
-    /// Bit `i` is set while worker `i` sleeps on `wake`.
-    sleeping: AtomicU64,
-    wake: Condvar,
-    shutdown: AtomicBool,
+    dispatch: CacheAligned<Dispatch>,
+    sleep: CacheAligned<Sleep>,
+    /// Worker `id` stores the epoch it finished here; one cache line per worker
+    /// so barrier completion never contends on a single counter.
+    worker_done: Box<[CacheAligned<AtomicU64>]>,
 }
+
+// SAFETY: `dispatch.job` points to a `Sync` closure and is written only while
+// holding `Pool::run_lock` after every participating worker of the prior region
+// has completed; workers read it only after observing the matching epoch with
+// `Acquire`/`SeqCst` and verifying `id < width`. Every other field is atomic or
+// synchronized.
+unsafe impl Send for Shared {}
+unsafe impl Sync for Shared {}
 
 pub struct Pool {
     shared: Arc<Shared>,
     workers: Vec<JoinHandle<()>>,
-    /// One region at a time: two threads sharing a pool take turns.
-    run_lock: Mutex<()>,
+    /// One region at a time; holds the current epoch so two callers take turns.
+    run_lock: Mutex<u64>,
 }
 
 impl Pool {
     /// A pool of `threads` threads in total: the caller of `run` is one of them.
     pub fn new(threads: usize) -> Self {
-        assert!(threads <= 64, "`Shared::sleeping` has one bit per thread");
+        let threads = threads.max(1);
+        assert!(threads <= 64, "`Sleep::sleeping` has one bit per thread");
+        let worker_done = (0..threads)
+            .map(|_| CacheAligned(AtomicU64::new(0)))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         let shared = Arc::new(Shared {
-            state: Mutex::new(State {
-                generation: 0,
-                job: None,
+            dispatch: CacheAligned(Dispatch {
+                state: AtomicU64::new(0),
+                job: UnsafeCell::new(&noop_region as RegionFn),
+                shutdown: AtomicBool::new(false),
             }),
-            generation: AtomicUsize::new(0),
-            width: AtomicUsize::new(0),
-            sleeping: AtomicU64::new(0),
-            wake: Condvar::new(),
-            shutdown: AtomicBool::new(false),
+            sleep: CacheAligned(Sleep {
+                sleeping: AtomicU64::new(0),
+                lock: Mutex::new(()),
+                wake: Condvar::new(),
+                panicked: AtomicBool::new(false),
+            }),
+            worker_done,
         });
-        let workers = (1..threads.max(1))
+        let workers = (1..threads)
             .map(|id| {
                 let shared = Arc::clone(&shared);
                 thread::spawn(move || worker(&shared, id))
@@ -110,12 +103,63 @@ impl Pool {
         Self {
             shared,
             workers,
-            run_lock: Mutex::new(()),
+            run_lock: Mutex::new(0),
         }
     }
 
     pub fn threads(&self) -> usize {
         self.workers.len() + 1
+    }
+
+    /// Calls `f(thread_id, actual_width)` once on each of `actual_width`
+    /// threads (`width.min(self.threads())`), returning when all finish.
+    /// Zero heap allocation and zero mutex locks while workers are spinning.
+    pub fn run_threads(&self, width: usize, f: &(dyn Fn(usize, usize) + Sync)) {
+        let actual_width = width.min(self.threads());
+        if actual_width <= 1 {
+            f(0, 1);
+            return;
+        }
+        let mut epoch_guard = self.run_lock.lock().unwrap();
+        *epoch_guard += 1;
+        let epoch = *epoch_guard;
+
+        // SAFETY: only the lifetime is erased. `run_lock` guarantees no other
+        // caller writes `job`, the prior region waited for all of its active
+        // workers to finish reading `job`, and this call will not return until
+        // every worker in `1..actual_width` stores `epoch` to `worker_done`.
+        let erased: RegionFn = unsafe { std::mem::transmute(f) };
+        unsafe { *self.shared.dispatch.0.job.get() = erased };
+
+        let packed = (epoch << 8) | actual_width as u64;
+        self.shared.dispatch.0.state.store(packed, SeqCst);
+
+        // Only a sleeper this region needs is worth a lock + system call:
+        // workers outside `actual_width` stay asleep through narrow regions.
+        let needed = (u64::MAX >> (64 - actual_width)) & !1;
+        if self.shared.sleep.0.sleeping.load(SeqCst) & needed != 0 {
+            let _guard = self.shared.sleep.0.lock.lock().unwrap();
+            self.shared.sleep.0.wake.notify_all();
+        }
+
+        // Catch panics on the caller too so we still wait for workers before
+        // unwinding and freeing the closure.
+        let caller_panicked = catch_unwind(AssertUnwindSafe(|| f(0, actual_width))).is_err();
+
+        for slot in &self.shared.worker_done[1..actual_width] {
+            while slot.0.load(Acquire) != epoch {
+                std::hint::spin_loop();
+            }
+        }
+
+        let worker_panicked = self.shared.sleep.0.panicked.load(Relaxed);
+        if worker_panicked {
+            self.shared.sleep.0.panicked.store(false, Relaxed);
+        }
+        assert!(
+            !caller_panicked && !worker_panicked,
+            "a task in a parallel region panicked"
+        );
     }
 
     /// Calls `f(i)` for every `i` in `0..n_tasks`, spread over the pool, and
@@ -132,42 +176,14 @@ impl Pool {
             (0..n_tasks).for_each(f);
             return;
         }
-        let _one_region = self.run_lock.lock().unwrap();
-        // SAFETY: only the lifetime is erased. This function does not return
-        // until `done == n_tasks`, and `Job::work` dereferences the pointer only
-        // for tasks that are not done yet.
-        let f: *const (dyn Fn(usize) + Sync) = unsafe { std::mem::transmute(f) };
-        let job = Arc::new(Job {
-            f,
-            n_tasks,
-            width,
-            next: AtomicUsize::new(0),
-            done: AtomicUsize::new(0),
-            panicked: AtomicBool::new(false),
+        let next = AtomicUsize::new(0);
+        self.run_threads(width.min(n_tasks), &|_, _| loop {
+            let i = next.fetch_add(1, Relaxed);
+            if i >= n_tasks {
+                break;
+            }
+            f(i);
         });
-
-        {
-            let mut state = self.shared.state.lock().unwrap();
-            state.generation += 1;
-            state.job = Some(Arc::clone(&job));
-            self.shared.width.store(width, Relaxed);
-            self.shared.generation.store(state.generation, Release);
-        }
-        // Only a sleeper this region needs is worth a system call: workers
-        // outside its width sleep through a run of narrow regions.
-        let needed = u64::MAX >> (64 - width.min(64)) & !1;
-        if self.shared.sleeping.load(Acquire) & needed != 0 {
-            self.shared.wake.notify_all();
-        }
-
-        job.work();
-        while job.done.load(Acquire) < n_tasks {
-            std::hint::spin_loop();
-        }
-        assert!(
-            !job.panicked.load(Relaxed),
-            "a task in a parallel region panicked"
-        );
     }
 
     /// Splits `data` into chunks of `chunk` elements (the last may be shorter)
@@ -215,60 +231,97 @@ impl Pool {
     }
 }
 
+/// Pins a worker thread to macOS's interactive QoS class so XNU keeps spinning
+/// workers on performance cores rather than migrating them to efficiency cores.
+#[cfg(target_os = "macos")]
+fn prefer_performance_core() {
+    unsafe extern "C" {
+        fn pthread_set_qos_class_self_np(class: u32, relative_priority: i32) -> i32;
+    }
+    const QOS_USER_INTERACTIVE: u32 = 0x21;
+    // SAFETY: valid QoS class constant, applies only to the calling thread.
+    unsafe { pthread_set_qos_class_self_np(QOS_USER_INTERACTIVE, 0) };
+}
+
+#[cfg(not(target_os = "macos"))]
+fn prefer_performance_core() {}
+
 fn worker(shared: &Shared, id: usize) {
-    let bit = 1 << id;
-    let mut seen = 0;
-    let mut spin_until = Instant::now() + SPIN;
+    prefer_performance_core();
+    let bit = 1u64 << id;
+    let mut seen = 0u64;
+    let mut polls = 0u32;
+    let mut spin_until: Option<Instant> = None;
     loop {
-        let mut polls = 0u32;
-        while shared.generation.load(Acquire) == seen {
-            if shared.shutdown.load(Relaxed) {
+        let s = loop {
+            let s = shared.dispatch.0.state.load(Acquire);
+            if (s >> 8) != seen {
+                break s;
+            }
+            if shared.dispatch.0.shutdown.load(Relaxed) {
                 return;
             }
-            polls += 1;
-            // Reading the clock costs more than a poll: check it rarely.
-            if polls.is_multiple_of(256) && Instant::now() > spin_until {
-                let mut state = shared.state.lock().unwrap();
-                // Re-checked under the lock: `run` publishes under it too, so
-                // either it already did (no sleep) or it will see `sleeping`.
-                while state.generation == seen && !shared.shutdown.load(Relaxed) {
-                    shared.sleeping.fetch_or(bit, Release);
-                    state = shared.wake.wait(state).unwrap();
-                    shared.sleeping.fetch_and(!bit, Release);
+            polls = polls.wrapping_add(1);
+            // Reading the clock costs more than a poll: check it rarely, and
+            // start the spin timer lazily so busy back-to-back regions never
+            // touch the clock.
+            if polls.is_multiple_of(256) {
+                let now = Instant::now();
+                let deadline = *spin_until.get_or_insert(now + SPIN);
+                if now > deadline {
+                    let mut guard = shared.sleep.0.lock.lock().unwrap();
+                    shared.sleep.0.sleeping.fetch_or(bit, SeqCst);
+                    let s = loop {
+                        let s = shared.dispatch.0.state.load(SeqCst);
+                        if shared.dispatch.0.shutdown.load(SeqCst) {
+                            shared.sleep.0.sleeping.fetch_and(!bit, Release);
+                            return;
+                        }
+                        let epoch = s >> 8;
+                        if epoch != seen {
+                            if id < (s & 0xff) as usize {
+                                break s;
+                            }
+                            // Narrow region excluding this worker: stay asleep.
+                            seen = epoch;
+                        }
+                        guard = shared.sleep.0.wake.wait(guard).unwrap();
+                    };
+                    shared.sleep.0.sleeping.fetch_and(!bit, Release);
+                    drop(guard);
+                    break s;
                 }
-                break;
             }
             std::hint::spin_loop();
-        }
-        // The width was stored before the generation this worker just saw, so a
-        // region that leaves it out costs it one load and no lock. The timer is
-        // not restarted: a worker left out of region after region goes to sleep.
-        // (If a newer region has already replaced the width, this worker sits
-        // out that one too: one region's parallelism is lost, never a task.)
-        if id >= shared.width.load(Relaxed) {
-            seen = shared.generation.load(Acquire);
+        };
+        let epoch = s >> 8;
+        let width = (s & 0xff) as usize;
+        seen = epoch;
+        if id >= width {
+            // Left out of this region: do not reset `spin_until`, so a worker
+            // skipped by region after region goes to sleep.
             continue;
         }
-        // A worker that missed a whole region just takes the newest job, and
-        // checks the width of that one: it may be narrower than the last.
-        let job = {
-            let state = shared.state.lock().unwrap();
-            seen = state.generation;
-            state.job.clone()
-        };
-        if let Some(job) = job.filter(|job| id < job.width) {
-            job.work();
+        // SAFETY: `epoch` was observed with `Acquire`/`SeqCst`, ordering the
+        // caller's write to `job` before this read, and `id < width` means the
+        // caller will not return or overwrite `job` before `worker_done[id] == epoch`.
+        let f = unsafe { &**shared.dispatch.0.job.get() };
+        if catch_unwind(AssertUnwindSafe(|| f(id, width))).is_err() {
+            shared.sleep.0.panicked.store(true, Relaxed);
         }
-        spin_until = Instant::now() + SPIN;
+        shared.worker_done[id].0.store(epoch, Release);
+        spin_until = None;
+        polls = 0;
     }
 }
 
 impl Drop for Pool {
     fn drop(&mut self) {
-        self.shared.shutdown.store(true, Relaxed);
+        self.shared.dispatch.0.shutdown.store(true, SeqCst);
         // Taking the lock orders this after any worker that is about to sleep.
-        drop(self.shared.state.lock().unwrap());
-        self.shared.wake.notify_all();
+        let _guard = self.shared.sleep.0.lock.lock().unwrap();
+        self.shared.sleep.0.wake.notify_all();
+        drop(_guard);
         for w in self.workers.drain(..) {
             let _ = w.join();
         }
@@ -356,5 +409,23 @@ mod tests {
         let mut data = vec![1u8; 5];
         pool.for_each_chunk_mut(&mut data, 2, |_, c| c.fill(9));
         assert_eq!(data, [9; 5]);
+    }
+
+    #[test]
+    fn run_threads_passes_distinct_ids_and_catches_caller_panic() {
+        let pool = Pool::new(4);
+        for req in [0, 1, 2, 4, 8] {
+            let want = req.clamp(1, 4);
+            let seen: Vec<AtomicUsize> = (0..want).map(|_| AtomicUsize::new(0)).collect();
+            pool.run_threads(req, &|tid, width| {
+                assert_eq!(width, want);
+                seen[tid].fetch_add(1, Relaxed);
+            });
+            assert!(seen.iter().all(|s| s.load(Relaxed) == 1));
+        }
+        let panicked = catch_unwind(AssertUnwindSafe(|| {
+            pool.run_threads(4, &|tid, _| assert_ne!(tid, 0));
+        }));
+        assert!(panicked.is_err());
     }
 }

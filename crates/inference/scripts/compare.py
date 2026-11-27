@@ -10,7 +10,9 @@ release as the installed binaries), once per type in (f32, q8_0):
     python convert_hf_to_gguf.py <repo>/crates/inference/data/qwen2.5-coder-0.5b \\
         --outtype <type> --outfile <repo>/crates/inference/data/gguf/qwen-<type>.gguf
 
-Every engine runs on the CPU cores only: no Metal and no Accelerate.
+Every engine runs on the CPU (Metal disabled via `--device none -ngl 0`; on
+macOS Homebrew's llama.cpp build still routes float32 prefill through Apple
+Accelerate, while this engine and candle run pure CPU NEON).
 Engines alternate within a round so drift hits all of them alike. llama.cpp and
 candle are tried on 6, 8 and 10 threads and keep their best one per phase; this
 engine uses its own default policy. Each engine keeps its own defaults

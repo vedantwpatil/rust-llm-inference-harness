@@ -1,4 +1,6 @@
-use crate::kernel::{Q8_BLOCK, packed_index, q8_scale, quantize_into};
+use crate::kernel::{
+    Q8_BLOCK, packed_index, packed_index_smmla8, q8_scale, quantize_into, use_i8mm,
+};
 
 /// A weight matrix stored `[rows = outputs, cols = inputs]`, row-major. Output
 /// `o` of `x @ W^T` is the dot product of `x` with the contiguous run of row
@@ -41,10 +43,19 @@ impl Matrix {
         }
     }
 
-    /// Where `Weights::Q8` keeps element `(row, col)`. Each group of four rows is
-    /// stored block by block (see `packed_index`) so a matmul streams them as
-    /// one run; the rows after the last whole group stay plain.
+    /// Where `Weights::Q8` keeps element `(row, col)`. Whole groups of 8 rows
+    /// (`smmla` layout when `i8mm` is available) or 4 rows (`sdot` layout
+    /// otherwise) are stored block by block so a matmul streams them
+    /// sequentially; leftover rows at the end stay plain.
     pub fn q8_index(&self, row: usize, col: usize) -> usize {
+        if use_i8mm() {
+            let whole = self.rows / 8 * 8;
+            if row < whole {
+                let first = row / 8 * 8;
+                return first * self.cols + packed_index_smmla8(row - first, col, self.cols);
+            }
+            return row * self.cols + col;
+        }
         let whole = self.rows / 4 * 4;
         let (first, group) = if row < whole {
             (row / 4 * 4, 4)
@@ -61,13 +72,28 @@ impl Matrix {
         let Weights::F32(data) = &self.weights else {
             return;
         };
+        let i8mm = use_i8mm();
+        let whole8 = self.rows / 8 * 8;
+        let full_blocks = self.cols / Q8_BLOCK;
         let mut values = vec![0i8; data.len()];
         let mut scales = Vec::with_capacity(self.rows);
+        let mut buf = [0i8; Q8_BLOCK];
         for (r, row) in data.chunks_exact(self.cols).enumerate() {
             let scale = q8_scale(row);
             for (b, block) in row.chunks(Q8_BLOCK).enumerate() {
-                let at = self.q8_index(r, b * Q8_BLOCK);
-                quantize_into(block, scale, &mut values[at..][..block.len()]);
+                if i8mm && r < whole8 && b < full_blocks {
+                    quantize_into(block, scale, &mut buf);
+                    let group_base = (r / 8 * 8) * self.cols + b * (8 * Q8_BLOCK);
+                    let pair = (r % 8) / 2;
+                    let in_pair = (r % 8) % 2;
+                    for step in 0..(Q8_BLOCK / 8) {
+                        let dst = group_base + (step * 4 + pair) * 16 + in_pair * 8;
+                        values[dst..dst + 8].copy_from_slice(&buf[step * 8..step * 8 + 8]);
+                    }
+                } else {
+                    let at = self.q8_index(r, b * Q8_BLOCK);
+                    quantize_into(block, scale, &mut values[at..][..block.len()]);
+                }
             }
             scales.push(scale);
         }

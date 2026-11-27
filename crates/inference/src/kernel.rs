@@ -124,6 +124,322 @@ pub fn exp(x: f32) -> f32 {
     p * f32::from_bits(((n as i32 + 127) as u32) << 23)
 }
 
+/// Fast 4-lane NEON `e^x` using Estrin's scheme for the same degree-6 series
+/// as `exp` (3 FMA dependency depth instead of 6).
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[inline(always)]
+unsafe fn vexpq_f32_fast(x: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+    unsafe {
+        let x = vminq_f32(vmaxq_f32(x, vdupq_n_f32(-87.0)), vdupq_n_f32(88.0));
+        let n = vrndaq_f32(vmulq_f32(x, vdupq_n_f32(std::f32::consts::LOG2_E)));
+        let r = vfmsq_f32(
+            vfmsq_f32(x, n, vdupq_n_f32(0.693_145_75)),
+            n,
+            vdupq_n_f32(1.428_606_8e-6),
+        );
+        let r2 = vmulq_f32(r, r);
+        let r4 = vmulq_f32(r2, r2);
+        let p01 = vaddq_f32(vdupq_n_f32(1.0), r);
+        let p23 = vfmaq_f32(vdupq_n_f32(0.5), r, vdupq_n_f32(1.0 / 6.0));
+        let p45 = vfmaq_f32(vdupq_n_f32(1.0 / 24.0), r, vdupq_n_f32(1.0 / 120.0));
+        let p456 = vfmaq_f32(p45, r2, vdupq_n_f32(1.0 / 720.0));
+        let p = vfmaq_f32(vfmaq_f32(p01, r2, p23), r4, p456);
+        let pow2 = vreinterpretq_f32_s32(vshlq_n_s32::<23>(vaddq_s32(
+            vcvtaq_s32_f32(n),
+            vdupq_n_s32(127),
+        )));
+        vmulq_f32(p, pow2)
+    }
+}
+
+/// Fast 4-lane NEON `1 / d` via estimate + 2 Newton-Raphson steps (full f32
+/// precision without `fdiv.4s` pipeline stalls).
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[inline(always)]
+unsafe fn vrecipq_f32_fast(d: std::arch::aarch64::float32x4_t) -> std::arch::aarch64::float32x4_t {
+    use std::arch::aarch64::*;
+    unsafe {
+        let mut r = vrecpeq_f32(d);
+        r = vmulq_f32(r, vrecpsq_f32(d, r));
+        r = vmulq_f32(r, vrecpsq_f32(d, r));
+        r
+    }
+}
+
+/// `out[i] = silu(gate[i]) * up[i]` for equal-length slices, 4-vector unrolled
+/// on aarch64.
+pub fn swiglu_slice(gate: &[f32], up: &[f32], out: &mut [std::mem::MaybeUninit<f32>]) {
+    let n = out.len();
+    assert_eq!(gate.len(), n);
+    assert_eq!(up.len(), n);
+    let mut i = 0;
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    {
+        use std::arch::aarch64::*;
+        let main = n & !15;
+        // SAFETY: `i + 16 <= main <= n`, and `out` is written via raw pointers.
+        unsafe {
+            let (gp, up_p, op) = (gate.as_ptr(), up.as_ptr(), out.as_mut_ptr().cast::<f32>());
+            let one = vdupq_n_f32(1.0);
+            while i < main {
+                let g0 = vld1q_f32(gp.add(i));
+                let g1 = vld1q_f32(gp.add(i + 4));
+                let g2 = vld1q_f32(gp.add(i + 8));
+                let g3 = vld1q_f32(gp.add(i + 12));
+                let r0 = vrecipq_f32_fast(vaddq_f32(one, vexpq_f32_fast(vnegq_f32(g0))));
+                let r1 = vrecipq_f32_fast(vaddq_f32(one, vexpq_f32_fast(vnegq_f32(g1))));
+                let r2 = vrecipq_f32_fast(vaddq_f32(one, vexpq_f32_fast(vnegq_f32(g2))));
+                let r3 = vrecipq_f32_fast(vaddq_f32(one, vexpq_f32_fast(vnegq_f32(g3))));
+                let u0 = vld1q_f32(up_p.add(i));
+                let u1 = vld1q_f32(up_p.add(i + 4));
+                let u2 = vld1q_f32(up_p.add(i + 8));
+                let u3 = vld1q_f32(up_p.add(i + 12));
+                vst1q_f32(op.add(i), vmulq_f32(vmulq_f32(g0, r0), u0));
+                vst1q_f32(op.add(i + 4), vmulq_f32(vmulq_f32(g1, r1), u1));
+                vst1q_f32(op.add(i + 8), vmulq_f32(vmulq_f32(g2, r2), u2));
+                vst1q_f32(op.add(i + 12), vmulq_f32(vmulq_f32(g3, r3), u3));
+                i += 16;
+            }
+        }
+    }
+    for j in i..n {
+        let g = gate[j];
+        out[j].write(g / (1.0 + exp(-g)) * up[j]);
+    }
+}
+
+/// GPT-2's tanh GELU approximation in place, 4-vector unrolled on aarch64.
+pub fn gelu_slice(x: &mut [f32]) {
+    const SQRT_2_OVER_PI: f32 = 0.797_884_6;
+    let n = x.len();
+    let mut i = 0;
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    {
+        use std::arch::aarch64::*;
+        let main = n & !15;
+        // SAFETY: `i + 16 <= main <= n`.
+        unsafe {
+            let p = x.as_mut_ptr();
+            let c0 = vdupq_n_f32(2.0 * SQRT_2_OVER_PI);
+            let c1 = vdupq_n_f32(0.044_715);
+            let one = vdupq_n_f32(1.0);
+            while i < main {
+                let x0 = vld1q_f32(p.add(i));
+                let x1 = vld1q_f32(p.add(i + 4));
+                let x2 = vld1q_f32(p.add(i + 8));
+                let x3 = vld1q_f32(p.add(i + 12));
+                // 0.5 * x * (2 - 2 / (e^(2a) + 1)) = x * (1 - 1 / (e^(2a) + 1)) = x / (1 + e^(-2a))
+                // Keeping `2a = 2 * sqrt(2/pi) * x * (1 + 0.044715 * x^2)`:
+                let a0 = vmulq_f32(c0, vfmaq_f32(x0, c1, vmulq_f32(vmulq_f32(x0, x0), x0)));
+                let a1 = vmulq_f32(c0, vfmaq_f32(x1, c1, vmulq_f32(vmulq_f32(x1, x1), x1)));
+                let a2 = vmulq_f32(c0, vfmaq_f32(x2, c1, vmulq_f32(vmulq_f32(x2, x2), x2)));
+                let a3 = vmulq_f32(c0, vfmaq_f32(x3, c1, vmulq_f32(vmulq_f32(x3, x3), x3)));
+                let r0 = vrecipq_f32_fast(vaddq_f32(one, vexpq_f32_fast(vnegq_f32(a0))));
+                let r1 = vrecipq_f32_fast(vaddq_f32(one, vexpq_f32_fast(vnegq_f32(a1))));
+                let r2 = vrecipq_f32_fast(vaddq_f32(one, vexpq_f32_fast(vnegq_f32(a2))));
+                let r3 = vrecipq_f32_fast(vaddq_f32(one, vexpq_f32_fast(vnegq_f32(a3))));
+                vst1q_f32(p.add(i), vmulq_f32(x0, r0));
+                vst1q_f32(p.add(i + 4), vmulq_f32(x1, r1));
+                vst1q_f32(p.add(i + 8), vmulq_f32(x2, r2));
+                vst1q_f32(p.add(i + 12), vmulq_f32(x3, r3));
+                i += 16;
+            }
+        }
+    }
+    for v in &mut x[i..] {
+        let inner = SQRT_2_OVER_PI * (*v + 0.044715 * *v * *v * *v);
+        *v = 0.5 * *v * (2.0 - 2.0 / (exp(2.0 * inner) + 1.0));
+    }
+}
+
+/// Normalizes one row with 4-accumulator NEON mean and variance (avoiding Rust's
+/// scalar sequential `iter().sum()`).
+pub fn layernorm_row(row: &[f32], gamma: &[f32], beta: &[f32], eps: f32, out: &mut [f32]) {
+    let w = row.len();
+    assert_eq!(gamma.len(), w);
+    assert_eq!(beta.len(), w);
+    assert_eq!(out.len(), w);
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    {
+        use std::arch::aarch64::*;
+        let main = w & !15;
+        // SAFETY: `i + 16 <= main <= w`, and all slices have length `w`.
+        unsafe {
+            let p = row.as_ptr();
+            let (mut s0, mut s1, mut s2, mut s3) = (
+                vdupq_n_f32(0.0),
+                vdupq_n_f32(0.0),
+                vdupq_n_f32(0.0),
+                vdupq_n_f32(0.0),
+            );
+            let mut i = 0;
+            while i < main {
+                s0 = vaddq_f32(s0, vld1q_f32(p.add(i)));
+                s1 = vaddq_f32(s1, vld1q_f32(p.add(i + 4)));
+                s2 = vaddq_f32(s2, vld1q_f32(p.add(i + 8)));
+                s3 = vaddq_f32(s3, vld1q_f32(p.add(i + 12)));
+                i += 16;
+            }
+            let mut sum = vaddvq_f32(vaddq_f32(vaddq_f32(s0, s1), vaddq_f32(s2, s3)));
+            for &v in &row[main..] {
+                sum += v;
+            }
+            let mean = sum / w as f32;
+            let vmean = vdupq_n_f32(mean);
+            let (mut q0, mut q1, mut q2, mut q3) = (
+                vdupq_n_f32(0.0),
+                vdupq_n_f32(0.0),
+                vdupq_n_f32(0.0),
+                vdupq_n_f32(0.0),
+            );
+            let mut i = 0;
+            while i < main {
+                let d0 = vsubq_f32(vld1q_f32(p.add(i)), vmean);
+                let d1 = vsubq_f32(vld1q_f32(p.add(i + 4)), vmean);
+                let d2 = vsubq_f32(vld1q_f32(p.add(i + 8)), vmean);
+                let d3 = vsubq_f32(vld1q_f32(p.add(i + 12)), vmean);
+                q0 = vfmaq_f32(q0, d0, d0);
+                q1 = vfmaq_f32(q1, d1, d1);
+                q2 = vfmaq_f32(q2, d2, d2);
+                q3 = vfmaq_f32(q3, d3, d3);
+                i += 16;
+            }
+            let mut var_sum = vaddvq_f32(vaddq_f32(vaddq_f32(q0, q1), vaddq_f32(q2, q3)));
+            for &v in &row[main..] {
+                let d = v - mean;
+                var_sum += d * d;
+            }
+            let inv_std = 1.0 / (var_sum / w as f32 + eps).sqrt();
+            let vinv = vdupq_n_f32(inv_std);
+            let (gp, bp, op) = (gamma.as_ptr(), beta.as_ptr(), out.as_mut_ptr());
+            let mut i = 0;
+            while i < main {
+                for off in [0, 4, 8, 12] {
+                    let norm = vmulq_f32(vsubq_f32(vld1q_f32(p.add(i + off)), vmean), vinv);
+                    let y = vfmaq_f32(vld1q_f32(bp.add(i + off)), norm, vld1q_f32(gp.add(i + off)));
+                    vst1q_f32(op.add(i + off), y);
+                }
+                i += 16;
+            }
+            for j in main..w {
+                out[j] = (row[j] - mean) * inv_std * gamma[j] + beta[j];
+            }
+        }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+    {
+        let mean = row.iter().sum::<f32>() / w as f32;
+        let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / w as f32;
+        let inv_std = 1.0 / (var + eps).sqrt();
+        for ((o, v), (g, b)) in out.iter_mut().zip(row).zip(gamma.iter().zip(beta)) {
+            *o = (v - mean) * inv_std * g + b;
+        }
+    }
+}
+
+/// Fast in-place softmax using NEON `exp` and reciprocal multiply (no `fdiv`).
+pub fn softmax_slice(x: &mut [f32]) {
+    if x.is_empty() {
+        return;
+    }
+    let n = x.len();
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    {
+        use std::arch::aarch64::*;
+        let mut i = 0;
+        let main = n & !3;
+        // SAFETY: `i + 4 <= main <= n`.
+        unsafe {
+            let p = x.as_mut_ptr();
+            let mut vmax = vdupq_n_f32(f32::NEG_INFINITY);
+            while i < main {
+                vmax = vmaxq_f32(vmax, vld1q_f32(p.add(i)));
+                i += 4;
+            }
+            let mut max = vmaxvq_f32(vmax);
+            for &v in &x[main..] {
+                if v > max {
+                    max = v;
+                }
+            }
+            let vmax = vdupq_n_f32(max);
+            let mut vsum = vdupq_n_f32(0.0);
+            let mut i = 0;
+            while i < main {
+                let e = vexpq_f32_fast(vsubq_f32(vld1q_f32(p.add(i)), vmax));
+                vst1q_f32(p.add(i), e);
+                vsum = vaddq_f32(vsum, e);
+                i += 4;
+            }
+            let mut sum = vaddvq_f32(vsum);
+            for v in &mut x[main..] {
+                let e = exp(*v - max);
+                *v = e;
+                sum += e;
+            }
+            let inv = 1.0 / sum;
+            let vinv = vdupq_n_f32(inv);
+            let mut i = 0;
+            while i < main {
+                vst1q_f32(p.add(i), vmulq_f32(vld1q_f32(p.add(i)), vinv));
+                i += 4;
+            }
+            for v in &mut x[main..] {
+                *v *= inv;
+            }
+        }
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+    {
+        let max = x.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let mut sum = 0.0f32;
+        for v in x.iter_mut() {
+            let e = exp(*v - max);
+            *v = e;
+            sum += e;
+        }
+        let inv = 1.0 / sum;
+        for v in x.iter_mut() {
+            *v *= inv;
+        }
+    }
+}
+
+/// Accumulates `sum_j weights[j] * v[j]` into `out[0..head_dim]`, keeping the
+/// full `head_dim = 64` accumulator in 16 NEON registers on aarch64.
+pub fn weighted_sum_rows(weights: &[f32], v: &[f32], stride: usize, out: &mut [f32]) {
+    let head_dim = out.len();
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    if head_dim == 64 {
+        use std::arch::aarch64::*;
+        // SAFETY: `head_dim == 64` (16 NEON vectors), and caller ensures
+        // `v.len() >= (weights.len() - 1) * stride + 64` when non-empty.
+        unsafe {
+            let mut acc = [vdupq_n_f32(0.0); 16];
+            for (j, &p) in weights.iter().enumerate() {
+                let vp = vdupq_n_f32(p);
+                let vjp = v[j * stride..][..64].as_ptr();
+                for (d, a) in acc.iter_mut().enumerate() {
+                    *a = vfmaq_f32(*a, vp, vld1q_f32(vjp.add(d * 4)));
+                }
+            }
+            let op = out.as_mut_ptr();
+            for (d, &a) in acc.iter().enumerate() {
+                vst1q_f32(op.add(d * 4), a);
+            }
+            return;
+        }
+    }
+    out.fill(0.0);
+    for (j, &p) in weights.iter().enumerate() {
+        let vj = &v[j * stride..][..head_dim];
+        for (acc, &val) in out.iter_mut().zip(vj) {
+            *acc = p.mul_add(val, *acc);
+        }
+    }
+}
+
 /// Activation values that share one int8 scale. A scale per whole token lets
 /// one outlier channel crush the precision of every other value in it (top-1
 /// agreement with f32 drops 2.5 points on Qwen); a scale per block confines the
@@ -143,6 +459,91 @@ pub fn quantize_into(row: &[f32], scale: f32, out: &mut [i8]) {
     let inv = 1.0 / scale;
     for (q, v) in out.iter_mut().zip(row) {
         *q = (v * inv).round() as i8;
+    }
+}
+
+/// Fused single-pass quantization of one block (up to `Q8_BLOCK` floats):
+/// returns the block scale and writes the rounded int8 values into `out`.
+/// Bit-identical to `q8_scale` followed by `quantize_into`, but reads `row`
+/// once in L1 and uses NEON vector max/round/narrow on aarch64.
+pub fn quantize_block(row: &[f32], out: &mut [i8]) -> f32 {
+    assert_eq!(row.len(), out.len());
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    if row.len() == Q8_BLOCK {
+        use std::arch::aarch64::*;
+        // SAFETY: `row` and `out` both have length `Q8_BLOCK` (128, a multiple
+        // of 16), and the cfg gate guarantees NEON.
+        unsafe {
+            let p = row.as_ptr();
+            let mut m0 = vdupq_n_f32(0.0);
+            let mut m1 = vdupq_n_f32(0.0);
+            let mut m2 = vdupq_n_f32(0.0);
+            let mut m3 = vdupq_n_f32(0.0);
+            for i in (0..Q8_BLOCK).step_by(16) {
+                m0 = vmaxq_f32(m0, vabsq_f32(vld1q_f32(p.add(i))));
+                m1 = vmaxq_f32(m1, vabsq_f32(vld1q_f32(p.add(i + 4))));
+                m2 = vmaxq_f32(m2, vabsq_f32(vld1q_f32(p.add(i + 8))));
+                m3 = vmaxq_f32(m3, vabsq_f32(vld1q_f32(p.add(i + 12))));
+            }
+            let max = vmaxvq_f32(vmaxq_f32(vmaxq_f32(m0, m1), vmaxq_f32(m2, m3)));
+            if max == 0.0 {
+                out.fill(0);
+                return 1.0;
+            }
+            let scale = max / 127.0;
+            let inv = vdupq_n_f32(1.0 / scale);
+            let dp = out.as_mut_ptr();
+            for i in (0..Q8_BLOCK).step_by(16) {
+                let a = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(p.add(i)), inv));
+                let b = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(p.add(i + 4)), inv));
+                let c = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(p.add(i + 8)), inv));
+                let d = vcvtaq_s32_f32(vmulq_f32(vld1q_f32(p.add(i + 12)), inv));
+                let ab = vqmovn_high_s32(vqmovn_s32(a), b);
+                let cd = vqmovn_high_s32(vqmovn_s32(c), d);
+                let abcd = vqmovn_high_s16(vqmovn_s16(ab), cd);
+                vst1q_s8(dp.add(i), abcd);
+            }
+            return scale;
+        }
+    }
+    let scale = q8_scale(row);
+    quantize_into(row, scale, out);
+    scale
+}
+
+/// Whether this CPU supports ARMv8.6 `i8mm` (`smmla` 2x8x2 int8 matrix multiply).
+#[inline]
+pub fn use_i8mm() -> bool {
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    {
+        std::arch::is_aarch64_feature_detected!("i8mm")
+    }
+    #[cfg(not(all(target_arch = "aarch64", target_feature = "neon")))]
+    {
+        false
+    }
+}
+
+/// Where element `col` of row `r` (`0..8`) sits in an 8-row `smmla` weight
+/// group of width `k`. Full `Q8_BLOCK` (128-element) blocks are laid out as 16
+/// steps of 8 elements, 4 row-pairs × 16 bytes per step (1024 contiguous bytes
+/// per block), so both 8×8 prefill and 8×1 decode stream sequentially. Any tail
+/// `col >= full * Q8_BLOCK` is stored plain row-by-row after the full blocks.
+#[inline]
+pub fn packed_index_smmla8(r: usize, col: usize, k: usize) -> usize {
+    let full = k / Q8_BLOCK;
+    let full_cols = full * Q8_BLOCK;
+    if col < full_cols {
+        let b = col / Q8_BLOCK;
+        let within = col % Q8_BLOCK;
+        let step = within / 8;
+        let lane = within % 8;
+        let pair = r / 2;
+        let in_pair = r % 2;
+        b * (8 * Q8_BLOCK) + (step * 4 + pair) * 16 + in_pair * 8 + lane
+    } else {
+        let rem = k - full_cols;
+        full * (8 * Q8_BLOCK) + r * rem + (col - full_cols)
     }
 }
 
@@ -287,8 +688,232 @@ pub fn tile_q8<const R: usize, const T: usize>(
     out
 }
 
-fn dot_i8(w: &[i8], x: &[i8]) -> i32 {
+pub(crate) fn dot_i8(w: &[i8], x: &[i8]) -> i32 {
     w.iter().zip(x).map(|(&a, &b)| a as i32 * b as i32).sum()
+}
+
+/// 8 weight rows (laid out by `packed_index_smmla8`) against 8 packed activation
+/// rows over the `full = k / Q8_BLOCK` full blocks of `k`, using ARMv8.6 `smmla`.
+/// Returns unscaled-weight dot products `out[r][t]`; the caller handles any
+/// partial block (`k % Q8_BLOCK`) and multiplies by each weight row's scale.
+///
+/// Uses all 32 NEON registers: `v0..v15` hold 16 int32 2×2 subtiles (64 outputs
+/// with zero horizontal `addp` reductions), while `v16..v23` and `v24..v31`
+/// double-buffer two 8-element steps per loop iteration.
+///
+/// # Safety
+/// The CPU must support ARMv8.6 `i8mm` (check `use_i8mm()`).
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[target_feature(enable = "i8mm")]
+pub unsafe fn tile_q8_smmla8_8x8(
+    w_blk: &[i8],
+    x_blk: &[i8],
+    s_blk: &[f32],
+    full_blocks: usize,
+) -> [[f32; 8]; 8] {
+    assert!(full_blocks * 8 * Q8_BLOCK <= w_blk.len());
+    assert!(full_blocks * 8 * Q8_BLOCK <= x_blk.len());
+    assert!(full_blocks * 16 <= s_blk.len());
+    let mut raw = [0.0f32; 64];
+    let wp = w_blk.as_ptr();
+    let xp = x_blk.as_ptr();
+    let sp = s_blk.as_ptr();
+    // SAFETY: caller guarantees `i8mm` via `target_feature`, asserts above
+    // bound all pointer increments (`1024` bytes per block for `wp` and `xp`,
+    // `64` bytes per block for `sp`, `256` bytes in `raw`).
+    unsafe {
+        std::arch::asm!(
+            ".arch_extension i8mm",
+            "cbz {b}, 3f",
+            "2:",
+            "movi v0.16b, #0",  "movi v1.16b, #0",  "movi v2.16b, #0",  "movi v3.16b, #0",
+            "movi v4.16b, #0",  "movi v5.16b, #0",  "movi v6.16b, #0",  "movi v7.16b, #0",
+            "movi v8.16b, #0",  "movi v9.16b, #0",  "movi v10.16b, #0", "movi v11.16b, #0",
+            "movi v12.16b, #0", "movi v13.16b, #0", "movi v14.16b, #0", "movi v15.16b, #0",
+            "mov {s}, #8", // 8 iterations x 2 steps x 8 elements = 128 elements
+            "4:",
+            // Step A
+            "ldp q16, q17, [{wp}], #32",
+            "ldp q18, q19, [{wp}], #32",
+            "ldp q20, q21, [{xp}], #32",
+            "ldp q22, q23, [{xp}], #32",
+            "smmla v0.4s,  v16.16b, v20.16b",
+            "smmla v1.4s,  v16.16b, v21.16b",
+            "smmla v2.4s,  v16.16b, v22.16b",
+            "smmla v3.4s,  v16.16b, v23.16b",
+            "smmla v4.4s,  v17.16b, v20.16b",
+            "smmla v5.4s,  v17.16b, v21.16b",
+            "smmla v6.4s,  v17.16b, v22.16b",
+            "smmla v7.4s,  v17.16b, v23.16b",
+            "smmla v8.4s,  v18.16b, v20.16b",
+            "smmla v9.4s,  v18.16b, v21.16b",
+            "smmla v10.4s, v18.16b, v22.16b",
+            "smmla v11.4s, v18.16b, v23.16b",
+            "smmla v12.4s, v19.16b, v20.16b",
+            "smmla v13.4s, v19.16b, v21.16b",
+            "smmla v14.4s, v19.16b, v22.16b",
+            "smmla v15.4s, v19.16b, v23.16b",
+            // Step B
+            "ldp q24, q25, [{wp}], #32",
+            "ldp q26, q27, [{wp}], #32",
+            "ldp q28, q29, [{xp}], #32",
+            "ldp q30, q31, [{xp}], #32",
+            "smmla v0.4s,  v24.16b, v28.16b",
+            "smmla v1.4s,  v24.16b, v29.16b",
+            "smmla v2.4s,  v24.16b, v30.16b",
+            "smmla v3.4s,  v24.16b, v31.16b",
+            "smmla v4.4s,  v25.16b, v28.16b",
+            "smmla v5.4s,  v25.16b, v29.16b",
+            "smmla v6.4s,  v25.16b, v30.16b",
+            "smmla v7.4s,  v25.16b, v31.16b",
+            "smmla v8.4s,  v26.16b, v28.16b",
+            "smmla v9.4s,  v26.16b, v29.16b",
+            "smmla v10.4s, v26.16b, v30.16b",
+            "smmla v11.4s, v26.16b, v31.16b",
+            "smmla v12.4s, v27.16b, v28.16b",
+            "smmla v13.4s, v27.16b, v29.16b",
+            "smmla v14.4s, v27.16b, v30.16b",
+            "smmla v15.4s, v27.16b, v31.16b",
+            "subs {s}, {s}, #1",
+            "b.ne 4b",
+            // Scale and accumulate into L1 `raw` once per 256 smmla instructions.
+            "ldp q20, q21, [{sp}], #32",
+            "ldp q22, q23, [{sp}], #32",
+            "scvtf v0.4s, v0.4s",   "scvtf v1.4s, v1.4s",   "scvtf v2.4s, v2.4s",   "scvtf v3.4s, v3.4s",
+            "ldp q24, q25, [{out}, #0]",  "ldp q26, q27, [{out}, #32]",
+            "fmla v24.4s, v0.4s, v20.4s", "fmla v25.4s, v1.4s, v21.4s",
+            "fmla v26.4s, v2.4s, v22.4s", "fmla v27.4s, v3.4s, v23.4s",
+            "stp q24, q25, [{out}, #0]",  "stp q26, q27, [{out}, #32]",
+            "scvtf v4.4s, v4.4s",   "scvtf v5.4s, v5.4s",   "scvtf v6.4s, v6.4s",   "scvtf v7.4s, v7.4s",
+            "ldp q24, q25, [{out}, #64]", "ldp q26, q27, [{out}, #96]",
+            "fmla v24.4s, v4.4s, v20.4s", "fmla v25.4s, v5.4s, v21.4s",
+            "fmla v26.4s, v6.4s, v22.4s", "fmla v27.4s, v7.4s, v23.4s",
+            "stp q24, q25, [{out}, #64]", "stp q26, q27, [{out}, #96]",
+            "scvtf v8.4s, v8.4s",   "scvtf v9.4s, v9.4s",   "scvtf v10.4s, v10.4s", "scvtf v11.4s, v11.4s",
+            "ldp q24, q25, [{out}, #128]", "ldp q26, q27, [{out}, #160]",
+            "fmla v24.4s, v8.4s, v20.4s",  "fmla v25.4s, v9.4s, v21.4s",
+            "fmla v26.4s, v10.4s, v22.4s", "fmla v27.4s, v11.4s, v23.4s",
+            "stp q24, q25, [{out}, #128]", "stp q26, q27, [{out}, #160]",
+            "scvtf v12.4s, v12.4s", "scvtf v13.4s, v13.4s", "scvtf v14.4s, v14.4s", "scvtf v15.4s, v15.4s",
+            "ldp q24, q25, [{out}, #192]", "ldp q26, q27, [{out}, #224]",
+            "fmla v24.4s, v12.4s, v20.4s", "fmla v25.4s, v13.4s, v21.4s",
+            "fmla v26.4s, v14.4s, v22.4s", "fmla v27.4s, v15.4s, v23.4s",
+            "stp q24, q25, [{out}, #192]", "stp q26, q27, [{out}, #224]",
+            "subs {b}, {b}, #1",
+            "b.ne 2b",
+            "3:",
+            b = inout(reg) full_blocks => _,
+            wp = inout(reg) wp => _,
+            xp = inout(reg) xp => _,
+            sp = inout(reg) sp => _,
+            out = in(reg) raw.as_mut_ptr(),
+            s = out(reg) _,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+            out("v4") _, out("v5") _, out("v6") _, out("v7") _,
+            out("v8") _, out("v9") _, out("v10") _, out("v11") _,
+            out("v12") _, out("v13") _, out("v14") _, out("v15") _,
+            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            out("v20") _, out("v21") _, out("v22") _, out("v23") _,
+            out("v24") _, out("v25") _, out("v26") _, out("v27") _,
+            out("v28") _, out("v29") _, out("v30") _, out("v31") _,
+            options(nostack),
+        );
+    }
+    let mut out = [[0.0f32; 8]; 8];
+    for p in 0..4 {
+        for q in 0..4 {
+            let base = (p * 4 + q) * 4;
+            out[p * 2][q * 2] = raw[base];
+            out[p * 2][q * 2 + 1] = raw[base + 1];
+            out[p * 2 + 1][q * 2] = raw[base + 2];
+            out[p * 2 + 1][q * 2 + 1] = raw[base + 3];
+        }
+    }
+    out
+}
+
+/// Single-token decode over an 8-row `smmla` weight group (`packed_index_smmla8`),
+/// streaming 1024-byte blocks sequentially.
+///
+/// # Safety
+/// The CPU must support ARMv8.6 `i8mm` (check `use_i8mm()`).
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[target_feature(enable = "i8mm")]
+pub unsafe fn tile_q8_smmla8_8x1(
+    w_blk: &[i8],
+    x: &[i8],
+    x_scales: &[f32],
+    k: usize,
+) -> [f32; 8] {
+    let blocks = k.div_ceil(Q8_BLOCK);
+    let full = k / Q8_BLOCK;
+    assert!(8 * k <= w_blk.len() && k <= x.len() && blocks <= x_scales.len());
+    let mut out = [0.0f32; 8];
+    let wp = w_blk.as_ptr();
+    let xp = x.as_ptr();
+    let sp = x_scales.as_ptr();
+    // SAFETY: caller guarantees `i8mm` via `target_feature`, asserts above
+    // bound all loads over the `full` 128-element blocks.
+    unsafe {
+        std::arch::asm!(
+            ".arch_extension i8mm",
+            "movi v8.16b, #0",
+            "movi v9.16b, #0",
+            "cbz {b}, 3f",
+            "2:",
+            "movi v0.16b, #0",
+            "movi v1.16b, #0",
+            "movi v2.16b, #0",
+            "movi v3.16b, #0",
+            "mov {s}, #16",
+            "4:",
+            "ldp q16, q17, [{wp}], #32",
+            "ldp q18, q19, [{wp}], #32",
+            "ld1r {{v20.2d}}, [{xp}], #8",
+            "smmla v0.4s, v16.16b, v20.16b",
+            "smmla v1.4s, v17.16b, v20.16b",
+            "smmla v2.4s, v18.16b, v20.16b",
+            "smmla v3.4s, v19.16b, v20.16b",
+            "subs {s}, {s}, #1",
+            "b.ne 4b",
+            // Each `v0..v3` holds `[r0·x, r0·x, r1·x, r1·x]`; `uzp1` packs lanes 0 and 2.
+            "uzp1 v0.4s, v0.4s, v1.4s",
+            "uzp1 v2.4s, v2.4s, v3.4s",
+            "ldr s21, [{sp}], #4",
+            "scvtf v0.4s, v0.4s",
+            "scvtf v2.4s, v2.4s",
+            "fmla v8.4s, v0.4s, v21.s[0]",
+            "fmla v9.4s, v2.4s, v21.s[0]",
+            "subs {b}, {b}, #1",
+            "b.ne 2b",
+            "3:",
+            "stp q8, q9, [{out}]",
+            b = inout(reg) full => _,
+            wp = inout(reg) wp => _,
+            xp = inout(reg) xp => _,
+            sp = inout(reg) sp => _,
+            out = in(reg) out.as_mut_ptr(),
+            s = out(reg) _,
+            out("v0") _, out("v1") _, out("v2") _, out("v3") _,
+            out("v8") _, out("v9") _,
+            out("v16") _, out("v17") _, out("v18") _, out("v19") _,
+            out("v20") _, out("v21") _,
+            options(nostack),
+        );
+    }
+    if full < blocks {
+        let at = full * Q8_BLOCK;
+        let rem = k - at;
+        let scale = x_scales[full];
+        for (r, acc) in out.iter_mut().enumerate() {
+            let sum = dot_i8(
+                &w_blk[full * 8 * Q8_BLOCK + r * rem..][..rem],
+                &x[at..][..rem],
+            );
+            *acc += sum as f32 * scale;
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -398,5 +1023,125 @@ mod tests {
     fn dot_toy_and_length_check() {
         assert_eq!(dot(&[1., 2., 3.], &[4., 5., 6.]), 32.0);
         assert!(std::panic::catch_unwind(|| dot(&[1.0], &[1.0, 2.0])).is_err());
+    }
+
+    #[test]
+    fn neon_elementwise_and_softmax_match_scalar_over_wide_range() {
+        let gate: Vec<f32> = (-1000..=1000).map(|i| i as f32 / 10.0).collect();
+        let up: Vec<f32> = (0..gate.len()).map(|i| ((i % 17) as f32 - 8.0) * 0.3).collect();
+        let mut out = vec![std::mem::MaybeUninit::uninit(); gate.len()];
+        swiglu_slice(&gate, &up, &mut out);
+        for (i, (&g, &u)) in gate.iter().zip(&up).enumerate() {
+            let got = unsafe { out[i].assume_init() };
+            let want = (g as f64 / (1.0 + (-g as f64).exp()) * u as f64) as f32;
+            let tol = 1e-5f32.max(want.abs() * 2e-6);
+            assert!(
+                (got - want).abs() <= tol,
+                "swiglu mismatch at g={g}: got={got}, want={want}"
+            );
+        }
+
+        let mut g_in = gate.clone();
+        gelu_slice(&mut g_in);
+        const SQRT_2_OVER_PI: f64 = 0.797_884_560_8;
+        for (&x, &got) in gate.iter().zip(&g_in) {
+            let xf = x as f64;
+            let want = (0.5 * xf * (1.0 + (SQRT_2_OVER_PI * (xf + 0.044715 * xf * xf * xf)).tanh()))
+                as f32;
+            let tol = 1e-4f32.max(want.abs() * 1e-5);
+            assert!(
+                (got - want).abs() <= tol,
+                "gelu mismatch at x={x}: got={got}, want={want}"
+            );
+        }
+
+        let mut sm: Vec<f32> = (-200..=200).map(|i| i as f32 * 0.25).collect();
+        let mut sm_ref = sm.clone();
+        softmax_slice(&mut sm);
+        let max = sm_ref.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let sum: f64 = sm_ref.iter().map(|&v| ((v - max) as f64).exp()).sum();
+        for (v, &orig) in sm_ref.iter_mut().zip(&sm) {
+            let want = (((*v - max) as f64).exp() / sum) as f32;
+            assert!((orig - want).abs() < 1e-6, "softmax mismatch: got={orig}, want={want}");
+        }
+    }
+
+    #[test]
+    fn quantize_block_matches_q8_scale_and_quantize_into() {
+        for len in [1, 17, Q8_BLOCK] {
+            let row = data(len, 9);
+            let want_scale = q8_scale(&row);
+            let mut want_q = vec![0i8; len];
+            quantize_into(&row, want_scale, &mut want_q);
+            let mut got_q = vec![0i8; len];
+            let got_scale = quantize_block(&row, &mut got_q);
+            assert_eq!(got_scale, want_scale);
+            assert_eq!(got_q, want_q);
+        }
+        let zeros = vec![0.0f32; Q8_BLOCK];
+        let mut q = vec![7i8; Q8_BLOCK];
+        assert_eq!(quantize_block(&zeros, &mut q), 1.0);
+        assert!(q.iter().all(|&v| v == 0));
+    }
+
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    #[test]
+    fn smmla8_tiles_match_naive() {
+        if !use_i8mm() {
+            return;
+        }
+        for k in [0, 3, 16, 100, Q8_BLOCK, Q8_BLOCK + 3, 3 * Q8_BLOCK, 896] {
+            let blocks = k.div_ceil(Q8_BLOCK);
+            let full = k / Q8_BLOCK;
+            let w: Vec<i8> = data(8 * k, 3).iter().map(|v| (v * 127.0) as i8).collect();
+            let mut w_packed = vec![0i8; 8 * k];
+            for r in 0..8 {
+                for c in 0..k {
+                    w_packed[packed_index_smmla8(r, c, k)] = w[r * k + c];
+                }
+            }
+            let x: Vec<i8> = data(8 * k, 4).iter().map(|v| (v * 127.0) as i8).collect();
+            let xs: Vec<f32> = data(8 * blocks, 5).iter().map(|v| v.abs() + 0.5).collect();
+            let mut x_packed = vec![0i8; full * 8 * Q8_BLOCK];
+            let mut s_packed = vec![0.0f32; full * 16];
+            for b in 0..full {
+                for s in 0..(Q8_BLOCK / 8) {
+                    for p in 0..4 {
+                        let base = b * 8 * Q8_BLOCK + (s * 4 + p) * 16;
+                        let col = b * Q8_BLOCK + s * 8;
+                        x_packed[base..base + 8].copy_from_slice(&x[(p * 2) * k + col..][..8]);
+                        x_packed[base + 8..base + 16]
+                            .copy_from_slice(&x[(p * 2 + 1) * k + col..][..8]);
+                    }
+                }
+                for p in 0..4 {
+                    let s0 = xs[(p * 2) * blocks + b];
+                    let s1 = xs[(p * 2 + 1) * blocks + b];
+                    s_packed[b * 16 + p * 4..][..4].copy_from_slice(&[s0, s1, s0, s1]);
+                }
+            }
+            let naive_full = |r: usize, t: usize| -> f32 {
+                (0..full * Q8_BLOCK)
+                    .map(|i| {
+                        w[r * k + i] as f64
+                            * x[t * k + i] as f64
+                            * xs[t * blocks + i / Q8_BLOCK] as f64
+                    })
+                    .sum::<f64>() as f32
+            };
+            let naive_all = |r: usize| -> f32 {
+                (0..k)
+                    .map(|i| w[r * k + i] as f64 * x[i] as f64 * xs[i / Q8_BLOCK] as f64)
+                    .sum::<f64>() as f32
+            };
+            let got8 = unsafe { tile_q8_smmla8_8x8(&w_packed, &x_packed, &s_packed, full) };
+            let got1 = unsafe { tile_q8_smmla8_8x1(&w_packed, &x[..k], &xs[..blocks], k) };
+            for r in 0..8 {
+                for (t, &v) in got8[r].iter().enumerate() {
+                    assert_close(&[v], &[naive_full(r, t)], 1e-4, 1e-4);
+                }
+                assert_close(&[got1[r]], &[naive_all(r)], 1e-4, 1e-4);
+            }
+        }
     }
 }
