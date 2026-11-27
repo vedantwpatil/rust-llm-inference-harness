@@ -2,7 +2,7 @@ use crate::backend::{AttnShape, Backend, Matrix};
 use crate::config::LlamaConfig;
 use crate::kv_cache::KvCache;
 use crate::model::{Model, Trace, note};
-use crate::ops::{add_in_place, split_columns};
+use crate::ops::add_in_place;
 use crate::safetensors::{Tensors, load, take};
 use std::path::Path;
 
@@ -186,14 +186,20 @@ impl<B: Backend> Llama<B> {
                 let (all_k, all_v) = &cache.layers[l];
                 (1, b.attention(q, all_k, all_v, shape))
             } else {
-                let [mut q, mut k, v]: [Vec<f32>; 3] = split_columns(&qkv, &[q_dim, kv_dim, kv_dim])
-                    .try_into()
-                    .unwrap();
-                b.rope(&mut k, pos0, c.n_kv_heads, c.head_dim, &self.inv_freq);
-                cache.append(l, &k, &v);
+                // Append keys and values directly into `cache` and rotate the
+                // new keys in place without temporary `k` and `v` vectors.
+                cache.append_qkv_kv(l, &qkv, q_dim);
+                b.rope(
+                    &mut cache.layers[l].0[pos0 * kv_dim..],
+                    pos0,
+                    c.n_kv_heads,
+                    c.head_dim,
+                    &self.inv_freq,
+                );
                 let (all_k, all_v) = &cache.layers[l];
+                let stride = q_dim + 2 * kv_dim;
                 if prune_last {
-                    let q_last = &mut q[(t - 1) * q_dim..];
+                    let q_last = &mut qkv[(t - 1) * stride..(t - 1) * stride + q_dim];
                     b.rope(q_last, pos0 + t - 1, c.n_heads, c.head_dim, &self.inv_freq);
                     let last_shape = AttnShape {
                         t: 1,
@@ -202,6 +208,10 @@ impl<B: Backend> Llama<B> {
                     };
                     (1, b.attention(q_last, all_k, all_v, last_shape))
                 } else {
+                    let mut q = Vec::with_capacity(t * q_dim);
+                    for row in qkv.chunks_exact(stride) {
+                        q.extend_from_slice(&row[..q_dim]);
+                    }
                     b.rope(&mut q, pos0, c.n_heads, c.head_dim, &self.inv_freq);
                     (t, b.attention(&q, all_k, all_v, shape))
                 }

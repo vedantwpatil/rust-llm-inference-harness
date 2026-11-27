@@ -106,7 +106,39 @@ impl Matrix {
         match &self.weights {
             Weights::F32(data) => out.extend_from_slice(&data[start..end]),
             Weights::Q8 { values, scales } => {
-                out.extend((0..self.cols).map(|c| values[self.q8_index(i, c)] as f32 * scales[i]))
+                let s = scales[i];
+                out.reserve(self.cols);
+                if use_i8mm() {
+                    let whole8 = self.rows / 8 * 8;
+                    if i < whole8 {
+                        let full = self.cols / Q8_BLOCK;
+                        let group_base = (i / 8 * 8) * self.cols;
+                        let pair = (i % 8) / 2;
+                        let in_pair = (i % 8) % 2;
+                        for b in 0..full {
+                            let bb = group_base + b * (8 * Q8_BLOCK);
+                            for step in 0..(Q8_BLOCK / 8) {
+                                let at = bb + (step * 4 + pair) * 16 + in_pair * 8;
+                                for &v in &values[at..at + 8] {
+                                    out.push(v as f32 * s);
+                                }
+                            }
+                        }
+                        let rem = self.cols - full * Q8_BLOCK;
+                        if rem > 0 {
+                            let at = group_base + full * (8 * Q8_BLOCK) + (i % 8) * rem;
+                            for &v in &values[at..at + rem] {
+                                out.push(v as f32 * s);
+                            }
+                        }
+                        return;
+                    }
+                    for &v in &values[start..end] {
+                        out.push(v as f32 * s);
+                    }
+                } else {
+                    out.extend((0..self.cols).map(|c| values[self.q8_index(i, c)] as f32 * s));
+                }
             }
         }
     }

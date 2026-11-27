@@ -37,6 +37,21 @@ impl KvCache {
         self.layers[layer].1.extend_from_slice(v);
     }
 
+    /// Appends `t` strided `[q | k | v]` rows directly into `layer`'s key and
+    /// value buffers without intermediate `k` and `v` vectors.
+    pub(crate) fn append_qkv_kv(&mut self, layer: usize, qkv: &[f32], q_dim: usize) {
+        let stride = q_dim + 2 * self.kv_dim;
+        assert_eq!(qkv.len() % stride, 0);
+        let t = qkv.len() / stride;
+        let (ks, vs) = &mut self.layers[layer];
+        ks.reserve(t * self.kv_dim);
+        vs.reserve(t * self.kv_dim);
+        for row in qkv.chunks_exact(stride) {
+            ks.extend_from_slice(&row[q_dim..q_dim + self.kv_dim]);
+            vs.extend_from_slice(&row[q_dim + self.kv_dim..]);
+        }
+    }
+
     /// Called once after every layer has appended the same `t` rows.
     pub(crate) fn advance(&mut self, t: usize) {
         self.len += t;

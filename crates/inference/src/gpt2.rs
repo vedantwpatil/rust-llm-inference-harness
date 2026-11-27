@@ -1,7 +1,7 @@
 use crate::backend::{AttnShape, Backend, Matrix};
 use crate::kv_cache::KvCache;
 use crate::model::{Model, Trace, note};
-use crate::ops::{add_in_place, embed, split_columns};
+use crate::ops::{add_in_place, embed};
 use crate::safetensors::{Tensors, take};
 
 // GPT-2 small. The checkpoint stores no hyperparameters; the layer count,
@@ -129,20 +129,24 @@ impl<B: Backend> Gpt2<B> {
                 let (all_k, all_v) = &cache.layers[l];
                 (1, b.attention(q, all_k, all_v, shape))
             } else {
-                let [q, k, v] = &split_columns(&qkv, &[w; 3])[..] else {
-                    unreachable!()
-                };
-                cache.append(l, k, v);
+                // Append keys and values straight from fused `qkv` into `cache`
+                // without allocating temporary `k` and `v` buffers.
+                cache.append_qkv_kv(l, &qkv, w);
                 let (all_k, all_v) = &cache.layers[l];
                 if prune_last {
+                    let q_last = &qkv[(t - 1) * 3 * w..(t - 1) * 3 * w + w];
                     let last_shape = AttnShape {
                         t: 1,
                         pos0: pos0 + t - 1,
                         ..shape
                     };
-                    (1, b.attention(&q[(t - 1) * w..], all_k, all_v, last_shape))
+                    (1, b.attention(q_last, all_k, all_v, last_shape))
                 } else {
-                    (t, b.attention(q, all_k, all_v, shape))
+                    let mut q = Vec::with_capacity(t * w);
+                    for row in qkv.chunks_exact(3 * w) {
+                        q.extend_from_slice(&row[..w]);
+                    }
+                    (t, b.attention(&q, all_k, all_v, shape))
                 }
             };
             if prune_last {

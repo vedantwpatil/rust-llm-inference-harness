@@ -14,9 +14,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 /// How long an idle worker spins before it sleeps on the condition variable.
-/// Longer than the serial gaps between two regions of one token, shorter than
-/// anything a caller does between tokens.
-const SPIN: Duration = Duration::from_micros(200);
+/// Longer than the gaps between wide and narrow regions inside a prefill layer
+/// (so extra workers do not sleep mid-prefill), shorter than interactive pauses.
+const SPIN: Duration = Duration::from_micros(1000);
 
 /// Pads a field to Apple Silicon's 128-byte cache line so hot atomics written
 /// by different threads do not share a line.
@@ -74,6 +74,7 @@ pub struct Pool {
 impl Pool {
     /// A pool of `threads` threads in total: the caller of `run` is one of them.
     pub fn new(threads: usize) -> Self {
+        prefer_performance_core();
         let threads = threads.max(1);
         assert!(threads <= 64, "`Sleep::sleeping` has one bit per thread");
         let worker_done = (0..threads)

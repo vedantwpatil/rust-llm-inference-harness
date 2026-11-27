@@ -1,10 +1,12 @@
 use crate::backend::{AttnShape, Backend, Matrix, Weights};
 use crate::kernel::{
-    Q8_BLOCK, dot, exp, gelu_slice, layernorm_row, quantize_block, softmax_slice, swiglu_slice,
-    tile, tile_q8, weighted_sum_rows,
+    Q8_BLOCK, dot, exp, gelu_slice, layernorm_row, quantize_block, rmsnorm_row, softmax_slice,
+    swiglu_slice, tile, tile_q8, weighted_sum_rows,
 };
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-use crate::kernel::{dot_i8, tile_q8_smmla8_8x1, tile_q8_smmla8_8x8, use_i8mm};
+use crate::kernel::{
+    dot_i8, tile_q8_smmla8_8x1, tile_q8_smmla8_8x8_store, use_i8mm, weighted_sum_rows_4_hd64,
+};
 use crate::pool::Pool;
 use std::mem::MaybeUninit;
 use std::sync::Mutex;
@@ -119,34 +121,46 @@ impl CpuBackend {
 
 impl CpuBackend {
     /// `f(row, out)` for every `width`-wide row of `x`, rows in parallel, each
-    /// result written to the matching row of the returned `Vec`.
-    fn map_rows(&self, x: &[f32], width: usize, f: impl Fn(&[f32], &mut [f32]) + Sync) -> Vec<f32> {
+    /// result written directly into uninitialized output memory.
+    fn map_rows(
+        &self,
+        x: &[f32],
+        width: usize,
+        f: impl Fn(&[f32], &mut [MaybeUninit<f32>]) + Sync,
+    ) -> Vec<f32> {
         assert_eq!(x.len() % width, 0);
-        let rows = x.len() / width;
-        let mut out = vec![0.0; x.len()];
-        let threads = self.elem_threads(x.len() * 4).min(rows);
-        if threads <= 1 {
-            for (row, o) in x.chunks_exact(width).zip(out.chunks_exact_mut(width)) {
-                f(row, o);
-            }
+        let total = x.len();
+        let rows = total / width;
+        let mut out: Vec<f32> = Vec::with_capacity(total);
+        if total == 0 {
             return out;
         }
-        let out_buf = SharedBuf::new(&mut out);
-        self.pool.run_threads(threads, &|tid, nw| {
-            let r0 = tid * rows / nw;
-            let r1 = (tid + 1) * rows / nw;
-            if r0 >= r1 {
-                return;
-            }
-            // SAFETY: `r0..r1` rows are disjoint across threads.
-            let dst = unsafe { out_buf.slice_mut(r0 * width, (r1 - r0) * width) };
-            for (row, o) in x[r0 * width..r1 * width]
-                .chunks_exact(width)
-                .zip(dst.chunks_exact_mut(width))
-            {
+        let spare = &mut out.spare_capacity_mut()[..total];
+        let threads = self.elem_threads(total * 4).min(rows);
+        if threads <= 1 {
+            for (row, o) in x.chunks_exact(width).zip(spare.chunks_exact_mut(width)) {
                 f(row, o);
             }
-        });
+        } else {
+            let out_buf = SharedBuf::new(spare);
+            self.pool.run_threads(threads, &|tid, nw| {
+                let r0 = tid * rows / nw;
+                let r1 = (tid + 1) * rows / nw;
+                if r0 >= r1 {
+                    return;
+                }
+                // SAFETY: `r0..r1` rows are disjoint across threads.
+                let dst = unsafe { out_buf.slice_mut(r0 * width, (r1 - r0) * width) };
+                for (row, o) in x[r0 * width..r1 * width]
+                    .chunks_exact(width)
+                    .zip(dst.chunks_exact_mut(width))
+                {
+                    f(row, o);
+                }
+            });
+        }
+        // SAFETY: every row `0..rows` was initialized above.
+        unsafe { out.set_len(total) };
         out
     }
 }
@@ -269,37 +283,6 @@ impl Operands for Q8Operands<'_> {
     }
 }
 
-/// Weight rows `first..first + rows` against every token: `out[r * t + i]` is
-/// row `first + r` dotted with token `i`. Rows go four at a time, tokens four
-/// at a time when there are that many, so a loaded weight is reused across
-/// tokens.
-fn matmul_block(ops: &impl Operands, first: usize, t: usize, out: &mut [f32]) {
-    let rows = out.len() / t;
-    let mut r = 0;
-    while r + 4 <= rows {
-        let mut i = 0;
-        while i + 4 <= t {
-            let tl = ops.tile::<4, 4, 1>(first + r, i);
-            for (a, row) in tl.iter().enumerate() {
-                out[(r + a) * t + i..][..4].copy_from_slice(row);
-            }
-            i += 4;
-        }
-        for i in i..t {
-            let tl = ops.tile::<4, 1, 4>(first + r, i);
-            for (a, row) in tl.iter().enumerate() {
-                out[(r + a) * t + i] = row[0];
-            }
-        }
-        r += 4;
-    }
-    for r in r..rows {
-        for i in 0..t {
-            out[r * t + i] = ops.tile::<1, 1, 4>(first + r, i)[0][0];
-        }
-    }
-}
-
 impl CpuBackend {
     /// `ops` is a `[t][n_in]` activation matrix against `n_out` weight rows;
     /// returns `[t][n_out]` with `bias` added.
@@ -318,49 +301,54 @@ impl CpuBackend {
             return Vec::new();
         }
         // One token: `[n_out][1]` is already `[1][n_out]`, so tasks write the
-        // result and bias directly. Small matrices (<= 2 MB) split statically
-        // across at most 6 threads (no atomic counter contention); larger ones
-        // use ~3 big contiguous chunks per thread to keep the hardware
-        // prefetcher streaming while absorbing OS scheduling jitter.
+        // result and bias directly into uninitialized output memory. Small
+        // matrices (<= 2 MB) split statically; larger ones divide into an exact
+        // multiple of `threads` (`3` tasks per thread) so no remainder task
+        // stalls the barrier.
         if t == 1 {
-            let mut out = vec![0.0; n_out];
+            let mut out: Vec<f32> = Vec::with_capacity(n_out);
             let total_bytes = row_bytes * n_out;
             let groups = n_out.div_ceil(4);
             let max_by_bytes = (total_bytes / (64 << 10)).max(1);
             let threads = self.threads(t).min(groups.max(1)).min(max_by_bytes);
-            if total_bytes <= 2 << 20 {
-                let threads = threads.min(6);
-                let out_buf = SharedBuf::new(&mut out);
-                self.pool.run_threads(threads, &|tid, width| {
-                    let r0 = (tid * groups / width) * 4;
-                    let r1 = ((tid + 1) * groups / width * 4).min(n_out);
-                    if r0 >= r1 {
-                        return;
-                    }
-                    // SAFETY: `r0..r1` is disjoint across `tid` and inside `out`.
-                    let slab = unsafe { out_buf.slice_mut(r0, r1 - r0) };
-                    matmul_block(ops, r0, 1, slab);
+            let out_buf = SharedBuf::new(&mut out.spare_capacity_mut()[..n_out]);
+            let run_range = |g0: usize, g1: usize| {
+                let r0 = g0 * 4;
+                let r1 = (g1 * 4).min(n_out);
+                if r0 >= r1 {
+                    return;
+                }
+                let mut r = r0;
+                while r + 4 <= r1 {
+                    let tl = ops.tile::<4, 1, 4>(r, 0);
+                    let mut vals = [tl[0][0], tl[1][0], tl[2][0], tl[3][0]];
                     if let Some(b) = bias {
-                        for (v, b) in slab.iter_mut().zip(&b[r0..r1]) {
-                            *v += b;
+                        for a in 0..4 {
+                            vals[a] += b[r + a];
                         }
                     }
+                    // SAFETY: `r0..r1` is disjoint across tasks and inside `out`.
+                    unsafe { out_buf.write_init(r, &vals) };
+                    r += 4;
+                }
+                for r in r..r1 {
+                    let v = ops.tile::<1, 1, 4>(r, 0)[0][0] + bias.map_or(0.0, |b| b[r]);
+                    // SAFETY: `r0..r1` is disjoint across tasks and inside `out`.
+                    unsafe { out_buf.write_init(r, &[v]) };
+                }
+            };
+            if total_bytes <= 2 << 20 {
+                self.pool.run_threads(threads, &|tid, width| {
+                    run_range(tid * groups / width, (tid + 1) * groups / width);
                 });
             } else {
-                // ~3 large contiguous chunks per thread (up to 16 MiB each),
-                // rounded to whole 4-row tiles.
-                let target = (total_bytes / (threads * 3)).clamp(256 << 10, 16 << 20);
-                let rows = (target / row_bytes).max(4) / 4 * 4;
-                self.pool
-                    .for_each_chunk_mut_width(threads, &mut out, rows, |c, slab| {
-                        matmul_block(ops, c * rows, 1, slab);
-                        if let Some(b) = bias {
-                            for (v, b) in slab.iter_mut().zip(&b[c * rows..]) {
-                                *v += b;
-                            }
-                        }
-                    });
+                let n_tasks = (threads * 3).min(groups);
+                self.pool.run_width(threads, n_tasks, &|task| {
+                    run_range(task * groups / n_tasks, (task + 1) * groups / n_tasks);
+                });
             }
+            // SAFETY: every element in `0..n_out` was initialized above.
+            unsafe { out.set_len(n_out) };
             return out;
         }
 
@@ -413,10 +401,101 @@ impl CpuBackend {
         out
     }
 
+    /// Float32 prefill (`t > 1`) using 6×4 NEON tiles (`24` accumulators = `2.4`
+    /// FMAs/load vs `2.0` for 4×4, zero spills and zero weight packing).
+    #[allow(clippy::needless_range_loop)]
+    fn prefill_f32(
+        &self,
+        w: &[f32],
+        x: &[f32],
+        t: usize,
+        n_out: usize,
+        k: usize,
+        bias: Option<&[f32]>,
+    ) -> Vec<f32> {
+        if let Some(b) = bias {
+            assert_eq!(b.len(), n_out);
+        }
+        if n_out == 0 || t == 0 {
+            return Vec::new();
+        }
+        let total = t * n_out;
+        let mut out: Vec<f32> = Vec::with_capacity(total);
+        let out_buf = SharedBuf::new(&mut out.spare_capacity_mut()[..total]);
+        let threads = self.pool.threads();
+        let groups = n_out.div_ceil(6);
+        let n_tasks = if groups <= threads * 20 {
+            groups
+        } else {
+            threads * 8
+        };
+        self.pool.run(n_tasks, &|task| {
+            let first = (task * groups / n_tasks) * 6;
+            let end = ((task + 1) * groups / n_tasks * 6).min(n_out);
+            let mut r = first;
+            while r + 6 <= end {
+                let bv: [f32; 6] = std::array::from_fn(|a| bias.map_or(0.0, |b| b[r + a]));
+                let mut i = 0;
+                while i + 4 <= t {
+                    let tl = tile::<6, 4, 1>(&w[r * k..], &x[i * k..], k);
+                    for j in 0..4 {
+                        let vals: [f32; 6] = std::array::from_fn(|a| tl[a][j] + bv[a]);
+                        // SAFETY: this task owns columns `first..end` of every row.
+                        unsafe { out_buf.write_init((i + j) * n_out + r, &vals) };
+                    }
+                    i += 4;
+                }
+                for i in i..t {
+                    let tl = tile::<6, 1, 2>(&w[r * k..], &x[i * k..], k);
+                    let vals: [f32; 6] = std::array::from_fn(|a| tl[a][0] + bv[a]);
+                    // SAFETY: this task owns columns `first..end` of every row.
+                    unsafe { out_buf.write_init(i * n_out + r, &vals) };
+                }
+                r += 6;
+            }
+            while r + 2 <= end {
+                let b0 = bias.map_or(0.0, |b| b[r]);
+                let b1 = bias.map_or(0.0, |b| b[r + 1]);
+                let mut i = 0;
+                while i + 4 <= t {
+                    let tl = tile::<2, 4, 2>(&w[r * k..], &x[i * k..], k);
+                    for j in 0..4 {
+                        let vals = [tl[0][j] + b0, tl[1][j] + b1];
+                        unsafe { out_buf.write_init((i + j) * n_out + r, &vals) };
+                    }
+                    i += 4;
+                }
+                for i in i..t {
+                    let tl = tile::<2, 1, 4>(&w[r * k..], &x[i * k..], k);
+                    let vals = [tl[0][0] + b0, tl[1][0] + b1];
+                    unsafe { out_buf.write_init(i * n_out + r, &vals) };
+                }
+                r += 2;
+            }
+            for r in r..end {
+                let b = bias.map_or(0.0, |b| b[r]);
+                let mut i = 0;
+                while i + 4 <= t {
+                    let tl = tile::<1, 4, 4>(&w[r * k..], &x[i * k..], k);
+                    for j in 0..4 {
+                        unsafe { out_buf.write_init((i + j) * n_out + r, &[tl[0][j] + b]) };
+                    }
+                    i += 4;
+                }
+                for i in i..t {
+                    let v = tile::<1, 1, 4>(&w[r * k..], &x[i * k..], k)[0][0] + b;
+                    unsafe { out_buf.write_init(i * n_out + r, &[v]) };
+                }
+            }
+        });
+        // SAFETY: every `(i, r)` in `0..t × 0..n_out` was initialized above.
+        unsafe { out.set_len(total) };
+        out
+    }
+
     /// Int8 matmul using ARMv8.6 `smmla` 8-row weight layout (`packed_index_smmla8`):
     /// 8×1 streaming decode and 8×8 prefill with fused quantize-and-pack.
     #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
-    #[allow(clippy::needless_range_loop)]
     fn matmul_q8_smmla8(
         &self,
         x: &[f32],
@@ -444,19 +523,43 @@ impl CpuBackend {
         let rem = k - full * Q8_BLOCK;
 
         if t == 1 {
-            let (xq, x_scales) = self.quantize_rows(x, 1, k);
-            let mut out = vec![0.0; n_out];
+            // Quantize single token into stack buffers for normal model widths
+            // (eliminating ~200 heap allocations per decoded token).
+            let blocks = k.div_ceil(Q8_BLOCK);
+            let mut stack_q = [0i8; 8192];
+            let mut stack_s = [0.0f32; 64];
+            let (heap_q, heap_s);
+            let (xq, x_scales): (&[i8], &[f32]) = if k <= stack_q.len() && blocks <= stack_s.len() {
+                for ((dst, s), vals) in stack_q[..k]
+                    .chunks_mut(Q8_BLOCK)
+                    .zip(stack_s[..blocks].iter_mut())
+                    .zip(x.chunks(Q8_BLOCK))
+                {
+                    *s = quantize_block(vals, dst);
+                }
+                (&stack_q[..k], &stack_s[..blocks])
+            } else {
+                (heap_q, heap_s) = self.quantize_rows(x, 1, k);
+                (&heap_q, &heap_s)
+            };
+
+            let mut out: Vec<f32> = Vec::with_capacity(n_out);
             let total_bytes = row_bytes * n_out;
             let groups = n_out.div_ceil(8);
             let max_by_bytes = (total_bytes / (64 << 10)).max(1);
             let threads = self.threads(1).min(groups.max(1)).min(max_by_bytes);
-            let run_slab = |r0: usize, slab: &mut [f32]| {
-                let r1 = r0 + slab.len();
+            let out_buf = SharedBuf::new(&mut out.spare_capacity_mut()[..n_out]);
+            let run_range = |g0: usize, g1: usize| {
+                let r0 = g0 * 8;
+                let r1 = (g1 * 8).min(n_out);
+                if r0 >= r1 {
+                    return;
+                }
                 let mut r = r0;
                 while r + 8 <= r1 {
                     // SAFETY: caller checked `use_i8mm()`, and `r` is a multiple of 8 < `whole8`.
                     let mut vals =
-                        unsafe { tile_q8_smmla8_8x1(&w[r * k..], &xq, &x_scales, k) };
+                        unsafe { tile_q8_smmla8_8x1(&w[r * k..], xq, x_scales, k) };
                     for a in 0..8 {
                         vals[a] *= w_scales[r + a];
                     }
@@ -465,35 +568,29 @@ impl CpuBackend {
                             vals[a] += b[r + a];
                         }
                     }
-                    slab[r - r0..r - r0 + 8].copy_from_slice(&vals);
+                    // SAFETY: `r0..r1` is disjoint across tasks and inside `out`.
+                    unsafe { out_buf.write_init(r, &vals) };
                     r += 8;
                 }
                 for r in r..r1 {
-                    let v = tile_q8::<1, 1>(&w[r * k..], &xq, &x_scales, k)[0][0] * w_scales[r]
+                    let v = tile_q8::<1, 1>(&w[r * k..], xq, x_scales, k)[0][0] * w_scales[r]
                         + bias.map_or(0.0, |b| b[r]);
-                    slab[r - r0] = v;
+                    // SAFETY: `r0..r1` is disjoint across tasks and inside `out`.
+                    unsafe { out_buf.write_init(r, &[v]) };
                 }
             };
             if total_bytes <= 2 << 20 {
-                let threads = threads.min(6);
-                let out_buf = SharedBuf::new(&mut out);
                 self.pool.run_threads(threads, &|tid, width| {
-                    let r0 = (tid * groups / width) * 8;
-                    let r1 = ((tid + 1) * groups / width * 8).min(n_out);
-                    if r0 >= r1 {
-                        return;
-                    }
-                    // SAFETY: `r0..r1` is disjoint across `tid`.
-                    run_slab(r0, unsafe { out_buf.slice_mut(r0, r1 - r0) });
+                    run_range(tid * groups / width, (tid + 1) * groups / width);
                 });
             } else {
-                let target = (total_bytes / (threads * 3)).clamp(256 << 10, 16 << 20);
-                let rows = (target / row_bytes).max(8) / 8 * 8;
-                self.pool
-                    .for_each_chunk_mut_width(threads, &mut out, rows, |c, slab| {
-                        run_slab(c * rows, slab);
-                    });
+                let n_tasks = (threads * 3).min(groups);
+                self.pool.run_width(threads, n_tasks, &|task| {
+                    run_range(task * groups / n_tasks, (task + 1) * groups / n_tasks);
+                });
             }
+            // SAFETY: every element in `0..n_out` was initialized above.
+            unsafe { out.set_len(n_out) };
             return out;
         }
 
@@ -527,11 +624,7 @@ impl CpuBackend {
             let sp_buf = SharedBuf::new(s_packed);
             let xt_buf = SharedBuf::new(x_tail);
             let xts_buf = SharedBuf::new(x_tail_scales);
-            let threads = if x.len() < 8192 {
-                1
-            } else {
-                self.pool.threads().min(t_groups)
-            };
+            let threads = self.elem_threads(x.len() * 4).min(t_groups);
             self.pool.run_threads(threads, &|tid, width| {
                 let g0 = tid * t_groups / width;
                 let g1 = (tid + 1) * t_groups / width;
@@ -593,49 +686,47 @@ impl CpuBackend {
         let threads = self.pool.threads();
         let row_groups = whole8 / 8;
         if row_groups > 0 {
-            let groups_per_task = row_groups.div_ceil(threads * 3).max(2);
-            self.pool
-                .run(row_groups.div_ceil(groups_per_task), &|c| {
-                    let g0 = c * groups_per_task;
-                    let g1 = (g0 + groups_per_task).min(row_groups);
-                    for rg in g0..g1 {
-                        let r_base = rg * 8;
-                        let w_blk = &w[r_base * k..][..8 * k];
-                        let ws: [f32; 8] = std::array::from_fn(|a| w_scales[r_base + a]);
-                        let bv: [f32; 8] =
-                            std::array::from_fn(|a| bias.map_or(0.0, |b| b[r_base + a]));
-                        for tg in 0..t_groups {
-                            // SAFETY: caller checked `use_i8mm()`.
-                            let mut tl = unsafe {
-                                tile_q8_smmla8_8x8(
-                                    w_blk,
-                                    &x_packed[tg * full * 8 * Q8_BLOCK..],
-                                    &s_packed[tg * full * 16..],
-                                    full,
-                                )
-                            };
-                            let t0 = tg * 8;
-                            let tn = 8.min(t - t0);
-                            if rem > 0 {
-                                let tail_base = full * 8 * Q8_BLOCK;
-                                for a in 0..8 {
-                                    let wt = &w_blk[tail_base + a * rem..][..rem];
-                                    for j in 0..tn {
-                                        let ti = t0 + j;
-                                        let sum = dot_i8(wt, &x_tail[ti * rem..][..rem]);
-                                        tl[a][j] += sum as f32 * x_tail_scales[ti];
-                                    }
-                                }
-                            }
-                            for j in 0..tn {
-                                let vals: [f32; 8] =
-                                    std::array::from_fn(|a| tl[a][j] * ws[a] + bv[a]);
-                                // SAFETY: this task owns columns `r_base..r_base + 8`.
-                                unsafe { out_buf.write_init((t0 + j) * n_out + r_base, &vals) };
-                            }
+            let n_tasks = if row_groups <= threads * 16 {
+                row_groups
+            } else {
+                threads * 4
+            };
+            self.pool.run(n_tasks, &|task| {
+                let g0 = task * row_groups / n_tasks;
+                let g1 = (task + 1) * row_groups / n_tasks;
+                for rg in g0..g1 {
+                    let r_base = rg * 8;
+                    let w_blk = &w[r_base * k..][..8 * k];
+                    let ws: [f32; 8] = std::array::from_fn(|a| w_scales[r_base + a]);
+                    let bv: [f32; 8] =
+                        std::array::from_fn(|a| bias.map_or(0.0, |b| b[r_base + a]));
+                    for tg in 0..t_groups {
+                        let t0 = tg * 8;
+                        let tn = 8.min(t - t0);
+                        let tail = if rem > 0 {
+                            Some((&x_tail[t0 * rem..], &x_tail_scales[t0..], rem))
+                        } else {
+                            None
+                        };
+                        // SAFETY: caller checked `use_i8mm()`, and this task owns
+                        // disjoint columns `r_base..r_base + 8` of every token row.
+                        unsafe {
+                            tile_q8_smmla8_8x8_store(
+                                w_blk,
+                                &x_packed[tg * full * 8 * Q8_BLOCK..],
+                                &s_packed[tg * full * 16..],
+                                full,
+                                &ws,
+                                &bv,
+                                tail,
+                                out_buf.ptr_at_init(t0 * n_out + r_base),
+                                n_out,
+                                tn,
+                            );
                         }
                     }
-                });
+                }
+            });
         }
         // Leftover `< 8` plain weight rows at the end (when `n_out % 8 != 0`).
         for r in whole8..n_out {
@@ -715,6 +806,18 @@ impl<'a, T: Copy> SharedBuf<'a, T> {
         // and disjoint across threads by the caller's promise.
         unsafe { std::slice::from_raw_parts_mut(self.ptr.add(at), len) }
     }
+
+    /// Raw pointer to element `at` for strided SIMD writes across rows.
+    ///
+    /// # Safety
+    /// Caller must stay in bounds and ensure disjointness across threads.
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    unsafe fn ptr_at(&self, at: usize) -> *mut T {
+        debug_assert!(at < self.len);
+        // SAFETY: in bounds by debug_assert, provenance comes from the whole
+        // underlying buffer rather than a sub-slice.
+        unsafe { self.ptr.add(at) }
+    }
 }
 
 impl<'a, T: Copy> SharedBuf<'a, MaybeUninit<T>> {
@@ -734,6 +837,16 @@ impl<'a, T: Copy> SharedBuf<'a, MaybeUninit<T>> {
             )
         };
     }
+
+    /// Raw pointer to element `at` as `*mut T` for direct SIMD stores.
+    ///
+    /// # Safety
+    /// Caller must stay in bounds and ensure disjointness across threads.
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    unsafe fn ptr_at_init(&self, at: usize) -> *mut T {
+        debug_assert!(at < self.len);
+        unsafe { self.ptr.add(at).cast::<T>() }
+    }
 }
 
 impl Backend for CpuBackend {
@@ -741,13 +854,18 @@ impl Backend for CpuBackend {
         let (n_out, k) = (w.rows, w.cols);
         assert_eq!(x.len(), t * k);
         match &w.weights {
-            Weights::F32(data) => self.product(
-                &F32Operands { w: data, x, k },
-                t,
-                n_out,
-                w.bytes() / n_out,
-                bias,
-            ),
+            Weights::F32(data) => {
+                if t > 1 {
+                    return self.prefill_f32(data, x, t, n_out, k, bias);
+                }
+                self.product(
+                    &F32Operands { w: data, x, k },
+                    t,
+                    n_out,
+                    w.bytes() / n_out.max(1),
+                    bias,
+                )
+            }
             Weights::Q8 { values, scales } => {
                 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
                 if use_i8mm() {
@@ -778,10 +896,7 @@ impl Backend for CpuBackend {
     fn rmsnorm(&self, x: &[f32], gamma: &[f32], eps: f32) -> Vec<f32> {
         let width = gamma.len();
         self.map_rows(x, width, |row, out| {
-            let scale = 1.0 / (dot(row, row) / width as f32 + eps).sqrt();
-            for ((o, v), g) in out.iter_mut().zip(row).zip(gamma) {
-                *o = v * scale * g;
-            }
+            rmsnorm_row(row, gamma, eps, out);
         })
     }
 
@@ -794,7 +909,9 @@ impl Backend for CpuBackend {
             return out;
         }
         let spare = &mut out.spare_capacity_mut()[..out_len];
-        let threads = self.elem_threads(gate_up.len() * 4);
+        // SwiGLU is exp-heavy (~2.5 µs for 4864 elements), so decode benefits
+        // from 4 threads and prefill scales across all performance cores.
+        let threads = (gate_up.len() * 4 / (8 << 10)).clamp(1, self.threads(rows));
         if threads <= 1 {
             for r in 0..rows {
                 let first = r * 2 * width;
@@ -925,7 +1042,13 @@ impl Backend for CpuBackend {
     }
 
     fn gelu(&self, x: &mut [f32]) {
-        let threads = self.elem_threads(x.len() * 4);
+        let bytes = x.len() * 4;
+        let max_t = if bytes >= (512 << 10) {
+            self.pool.threads()
+        } else {
+            self.threads(1)
+        };
+        let threads = (bytes / (64 << 10)).clamp(1, max_t);
         if threads <= 1 {
             gelu_slice(x);
             return;
@@ -1100,16 +1223,17 @@ impl Backend for CpuBackend {
         }
 
         // Prefill (`t > 1`): repack K and V once into contiguous head-major
-        // `[n_kv_heads][n_keys_total][head_dim]` and tile 4 queries × 4 keys.
+        // `[n_kv_heads][n_keys_total][head_dim]` with sequential writes, and
+        // tile 4 queries × 4 keys.
         let kv_stride = n_keys_total * head_dim;
-        let mut k_hm = vec![0.0f32; k.len()];
-        let mut v_hm = vec![0.0f32; v.len()];
-        for pos in 0..n_keys_total {
-            for kvh in 0..n_kv_heads {
-                let src = pos * kv_dim + kvh * head_dim;
-                let dst = kvh * kv_stride + pos * head_dim;
-                k_hm[dst..dst + head_dim].copy_from_slice(&k[src..src + head_dim]);
-                v_hm[dst..dst + head_dim].copy_from_slice(&v[src..src + head_dim]);
+        let mut k_hm = Vec::with_capacity(k.len());
+        let mut v_hm = Vec::with_capacity(v.len());
+        for kvh in 0..n_kv_heads {
+            let off = kvh * head_dim;
+            for pos in 0..n_keys_total {
+                let src = pos * kv_dim + off;
+                k_hm.extend_from_slice(&k[src..src + head_dim]);
+                v_hm.extend_from_slice(&v[src..src + head_dim]);
             }
         }
 
@@ -1119,99 +1243,111 @@ impl Backend for CpuBackend {
         let split = (t * 7 / 10) / 4 * 4;
         let n_tasks = n_heads * halves;
         let out_buf = SharedBuf::new(&mut out);
-        let threads = self.threads(t).min(n_tasks);
-        self.pool.run_threads(threads, &|tid, nw| {
-            let task0 = tid * n_tasks / nw;
-            let task1 = (tid + 1) * n_tasks / nw;
-            let mut q_contig = Vec::new();
+        // Cap prefill attention at `DECODE_THREADS` (8) with dynamic claiming to
+        // avoid 10-core OS stragglers on short ~50 µs attention regions.
+        let threads = self.threads(1).min(n_tasks);
+        self.pool.run_width(threads, n_tasks, &|task| {
+            let h = task / halves;
+            let half = task % halves;
+            let (i_start, i_end) = if halves == 1 {
+                (0, t)
+            } else if half == 0 {
+                (0, split)
+            } else {
+                (split, t)
+            };
+            let len_q = i_end - i_start;
+            if len_q == 0 {
+                return;
+            }
+            let mut q_contig = vec![0.0f32; len_q * head_dim];
             let mut scores = vec![0.0f32; 4 * n_keys_total];
-            for task in task0..task1 {
-                let h = task / halves;
-                let half = task % halves;
-                let (i_start, i_end) = if halves == 1 {
-                    (0, t)
-                } else if half == 0 {
-                    (0, split)
-                } else {
-                    (split, t)
-                };
-                let len_q = i_end - i_start;
-                if len_q == 0 {
-                    continue;
-                }
-                q_contig.resize(len_q * head_dim, 0.0);
-                for j in 0..len_q {
-                    q_contig[j * head_dim..][..head_dim]
-                        .copy_from_slice(&q[(i_start + j) * q_dim + h * head_dim..][..head_dim]);
-                }
-                let kvh = h / group;
-                let ks = &k_hm[kvh * kv_stride..][..kv_stride];
-                let vs = &v_hm[kvh * kv_stride..][..kv_stride];
+            for j in 0..len_q {
+                q_contig[j * head_dim..][..head_dim]
+                    .copy_from_slice(&q[(i_start + j) * q_dim + h * head_dim..][..head_dim]);
+            }
+            let kvh = h / group;
+            let ks = &k_hm[kvh * kv_stride..][..kv_stride];
+            let vs = &v_hm[kvh * kv_stride..][..kv_stride];
 
-                let mut qi = 0;
-                while qi + 4 <= len_q {
-                    let pos_max = pos0 + i_start + qi + 4;
-                    let mut kj = 0;
-                    while kj + 4 <= pos_max {
-                        let tl = tile::<4, 4, 1>(
-                            &q_contig[qi * head_dim..],
-                            &ks[kj * head_dim..],
-                            head_dim,
-                        );
-                        for a in 0..4 {
-                            for b in 0..4 {
-                                scores[a * n_keys_total + kj + b] = tl[a][b] * scale;
-                            }
-                        }
-                        kj += 4;
-                    }
-                    for b in kj..pos_max {
-                        let tl = tile::<4, 1, 4>(
-                            &q_contig[qi * head_dim..],
-                            &ks[b * head_dim..],
-                            head_dim,
-                        );
-                        for a in 0..4 {
-                            scores[a * n_keys_total + b] = tl[a][0] * scale;
-                        }
-                    }
+            let mut qi = 0;
+            while qi + 4 <= len_q {
+                let pos_max = pos0 + i_start + qi + 4;
+                let mut kj = 0;
+                while kj + 4 <= pos_max {
+                    let tl = tile::<4, 4, 1>(
+                        &q_contig[qi * head_dim..],
+                        &ks[kj * head_dim..],
+                        head_dim,
+                    );
                     for a in 0..4 {
-                        let n_keys = pos0 + i_start + qi + a + 1;
-                        let sc = &mut scores[a * n_keys_total..][..n_keys];
-                        softmax_slice(sc);
-                        // SAFETY: `(i_start + qi + a, h)` is unique to this task.
-                        let dst = unsafe {
-                            out_buf.slice_mut(
-                                (i_start + qi + a) * q_dim + h * head_dim,
-                                head_dim,
-                            )
-                        };
-                        weighted_sum_rows(sc, vs, head_dim, dst);
+                        for b in 0..4 {
+                            scores[a * n_keys_total + kj + b] = tl[a][b] * scale;
+                        }
+                    }
+                    kj += 4;
+                }
+                for b in kj..pos_max {
+                    let tl = tile::<4, 1, 4>(
+                        &q_contig[qi * head_dim..],
+                        &ks[b * head_dim..],
+                        head_dim,
+                    );
+                    for a in 0..4 {
+                        scores[a * n_keys_total + b] = tl[a][0] * scale;
+                    }
+                }
+                for a in 0..4 {
+                    let n_keys = pos0 + i_start + qi + a + 1;
+                    let sc = &mut scores[a * n_keys_total..][..n_keys];
+                    softmax_slice(sc);
+                    scores[a * n_keys_total + n_keys..a * n_keys_total + pos_max].fill(0.0);
+                }
+                #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+                if head_dim == 64 {
+                    // SAFETY: queries `i_start + qi .. + 4` of head `h` are unique to this task.
+                    let base = unsafe { out_buf.ptr_at((i_start + qi) * q_dim + h * head_dim) };
+                    unsafe {
+                        weighted_sum_rows_4_hd64(&scores, n_keys_total, pos_max, vs, base, q_dim);
                     }
                     qi += 4;
+                    continue;
                 }
-                for a in qi..len_q {
-                    let n_keys = pos0 + i_start + a + 1;
-                    let qv = &q_contig[a * head_dim..][..head_dim];
-                    let mut kj = 0;
-                    while kj + 4 <= n_keys {
-                        let tl = tile::<4, 1, 4>(&ks[kj * head_dim..], qv, head_dim);
-                        for b in 0..4 {
-                            scores[kj + b] = tl[b][0] * scale;
-                        }
-                        kj += 4;
-                    }
-                    for b in kj..n_keys {
-                        scores[b] = dot(qv, &ks[b * head_dim..][..head_dim]) * scale;
-                    }
-                    let sc = &mut scores[..n_keys];
-                    softmax_slice(sc);
-                    // SAFETY: `(i_start + a, h)` is unique to this task.
+                for a in 0..4 {
+                    let n_keys = pos0 + i_start + qi + a + 1;
+                    let sc = &scores[a * n_keys_total..][..n_keys];
+                    // SAFETY: `(i_start + qi + a, h)` is unique to this task.
                     let dst = unsafe {
-                        out_buf.slice_mut((i_start + a) * q_dim + h * head_dim, head_dim)
+                        out_buf.slice_mut(
+                            (i_start + qi + a) * q_dim + h * head_dim,
+                            head_dim,
+                        )
                     };
                     weighted_sum_rows(sc, vs, head_dim, dst);
                 }
+                qi += 4;
+            }
+            for a in qi..len_q {
+                let n_keys = pos0 + i_start + a + 1;
+                let qv = &q_contig[a * head_dim..][..head_dim];
+                let mut kj = 0;
+                while kj + 4 <= n_keys {
+                    let tl = tile::<4, 1, 4>(&ks[kj * head_dim..], qv, head_dim);
+                    for b in 0..4 {
+                        scores[kj + b] = tl[b][0] * scale;
+                    }
+                    kj += 4;
+                }
+                for b in kj..n_keys {
+                    scores[b] = dot(qv, &ks[b * head_dim..][..head_dim]) * scale;
+                }
+                let sc = &mut scores[..n_keys];
+                softmax_slice(sc);
+                // SAFETY: `(i_start + a, h)` is unique to this task.
+                let dst = unsafe {
+                    out_buf.slice_mut((i_start + a) * q_dim + h * head_dim, head_dim)
+                };
+                weighted_sum_rows(sc, vs, head_dim, dst);
             }
         });
         out

@@ -254,8 +254,14 @@ pub fn gelu_slice(x: &mut [f32]) {
 }
 
 /// Normalizes one row with 4-accumulator NEON mean and variance (avoiding Rust's
-/// scalar sequential `iter().sum()`).
-pub fn layernorm_row(row: &[f32], gamma: &[f32], beta: &[f32], eps: f32, out: &mut [f32]) {
+/// scalar sequential `iter().sum()`), writing into `out`.
+pub fn layernorm_row(
+    row: &[f32],
+    gamma: &[f32],
+    beta: &[f32],
+    eps: f32,
+    out: &mut [std::mem::MaybeUninit<f32>],
+) {
     let w = row.len();
     assert_eq!(gamma.len(), w);
     assert_eq!(beta.len(), w);
@@ -312,7 +318,11 @@ pub fn layernorm_row(row: &[f32], gamma: &[f32], beta: &[f32], eps: f32, out: &m
             }
             let inv_std = 1.0 / (var_sum / w as f32 + eps).sqrt();
             let vinv = vdupq_n_f32(inv_std);
-            let (gp, bp, op) = (gamma.as_ptr(), beta.as_ptr(), out.as_mut_ptr());
+            let (gp, bp, op) = (
+                gamma.as_ptr(),
+                beta.as_ptr(),
+                out.as_mut_ptr().cast::<f32>(),
+            );
             let mut i = 0;
             while i < main {
                 for off in [0, 4, 8, 12] {
@@ -323,7 +333,7 @@ pub fn layernorm_row(row: &[f32], gamma: &[f32], beta: &[f32], eps: f32, out: &m
                 i += 16;
             }
             for j in main..w {
-                out[j] = (row[j] - mean) * inv_std * gamma[j] + beta[j];
+                out[j].write((row[j] - mean) * inv_std * gamma[j] + beta[j]);
             }
         }
     }
@@ -333,8 +343,38 @@ pub fn layernorm_row(row: &[f32], gamma: &[f32], beta: &[f32], eps: f32, out: &m
         let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / w as f32;
         let inv_std = 1.0 / (var + eps).sqrt();
         for ((o, v), (g, b)) in out.iter_mut().zip(row).zip(gamma.iter().zip(beta)) {
-            *o = (v - mean) * inv_std * g + b;
+            o.write((v - mean) * inv_std * g + b);
         }
+    }
+}
+
+/// Scales one row by `1 / sqrt(mean(x^2) + eps) * gamma`, writing directly into
+/// uninitialized `out` with 4-vector unrolled NEON on aarch64.
+pub fn rmsnorm_row(row: &[f32], gamma: &[f32], eps: f32, out: &mut [std::mem::MaybeUninit<f32>]) {
+    let w = row.len();
+    assert_eq!(gamma.len(), w);
+    assert_eq!(out.len(), w);
+    let scale = 1.0 / (dot(row, row) / w as f32 + eps).sqrt();
+    let mut i = 0;
+    #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+    {
+        use std::arch::aarch64::*;
+        let main = w & !15;
+        // SAFETY: `i + 16 <= main <= w`, and all slices have length `w`.
+        unsafe {
+            let (p, gp, op) = (row.as_ptr(), gamma.as_ptr(), out.as_mut_ptr().cast::<f32>());
+            let vs = vdupq_n_f32(scale);
+            while i < main {
+                for off in [0, 4, 8, 12] {
+                    let y = vmulq_f32(vmulq_f32(vld1q_f32(p.add(i + off)), vs), vld1q_f32(gp.add(i + off)));
+                    vst1q_f32(op.add(i + off), y);
+                }
+                i += 16;
+            }
+        }
+    }
+    for j in i..w {
+        out[j].write(row[j] * scale * gamma[j]);
     }
 }
 
@@ -436,6 +476,79 @@ pub fn weighted_sum_rows(weights: &[f32], v: &[f32], stride: usize, out: &mut [f
         let vj = &v[j * stride..][..head_dim];
         for (acc, &val) in out.iter_mut().zip(vj) {
             *acc = p.mul_add(val, *acc);
+        }
+    }
+}
+
+/// Batched 4-query `P @ V` for `head_dim == 64` on aarch64: loads each value
+/// vector once across 4 queries (4× fewer value loads than `weighted_sum_rows`).
+/// `scores` holds 4 rows of stride `score_stride` with zeroed causal tails up
+/// to `n_keys`.
+///
+/// # Safety
+/// `out0`..`out3` (`out_base.add(a * out_stride)` for `a in 0..4`) must be valid
+/// for disjoint writes of 64 floats each.
+#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+pub unsafe fn weighted_sum_rows_4_hd64(
+    scores: &[f32],
+    score_stride: usize,
+    n_keys: usize,
+    v: &[f32],
+    out_base: *mut f32,
+    out_stride: usize,
+) {
+    use std::arch::aarch64::*;
+    assert!(3 * score_stride + n_keys <= scores.len());
+    assert!(n_keys * 64 <= v.len());
+    // SAFETY: bounds checked above; caller guarantees disjoint `out` rows.
+    unsafe {
+        let s0 = scores.as_ptr();
+        let s1 = s0.add(score_stride);
+        let s2 = s0.add(2 * score_stride);
+        let s3 = s0.add(3 * score_stride);
+        let vp = v.as_ptr();
+        let o0 = out_base;
+        let o1 = o0.add(out_stride);
+        let o2 = o1.add(out_stride);
+        let o3 = o2.add(out_stride);
+        for strip in (0..64).step_by(16) {
+            let mut a0 = [vdupq_n_f32(0.0); 4];
+            let mut a1 = [vdupq_n_f32(0.0); 4];
+            let mut a2 = [vdupq_n_f32(0.0); 4];
+            let mut a3 = [vdupq_n_f32(0.0); 4];
+            for j in 0..n_keys {
+                let vj = vp.add(j * 64 + strip);
+                let v0 = vld1q_f32(vj);
+                let v1 = vld1q_f32(vj.add(4));
+                let v2 = vld1q_f32(vj.add(8));
+                let v3 = vld1q_f32(vj.add(12));
+                let p0 = vdupq_n_f32(*s0.add(j));
+                let p1 = vdupq_n_f32(*s1.add(j));
+                let p2 = vdupq_n_f32(*s2.add(j));
+                let p3 = vdupq_n_f32(*s3.add(j));
+                a0[0] = vfmaq_f32(a0[0], p0, v0);
+                a0[1] = vfmaq_f32(a0[1], p0, v1);
+                a0[2] = vfmaq_f32(a0[2], p0, v2);
+                a0[3] = vfmaq_f32(a0[3], p0, v3);
+                a1[0] = vfmaq_f32(a1[0], p1, v0);
+                a1[1] = vfmaq_f32(a1[1], p1, v1);
+                a1[2] = vfmaq_f32(a1[2], p1, v2);
+                a1[3] = vfmaq_f32(a1[3], p1, v3);
+                a2[0] = vfmaq_f32(a2[0], p2, v0);
+                a2[1] = vfmaq_f32(a2[1], p2, v1);
+                a2[2] = vfmaq_f32(a2[2], p2, v2);
+                a2[3] = vfmaq_f32(a2[3], p2, v3);
+                a3[0] = vfmaq_f32(a3[0], p3, v0);
+                a3[1] = vfmaq_f32(a3[1], p3, v1);
+                a3[2] = vfmaq_f32(a3[2], p3, v2);
+                a3[3] = vfmaq_f32(a3[3], p3, v3);
+            }
+            for d in 0..4 {
+                vst1q_f32(o0.add(strip + d * 4), a0[d]);
+                vst1q_f32(o1.add(strip + d * 4), a1[d]);
+                vst1q_f32(o2.add(strip + d * 4), a2[d]);
+                vst1q_f32(o3.add(strip + d * 4), a3[d]);
+            }
         }
     }
 }
@@ -692,28 +805,40 @@ pub(crate) fn dot_i8(w: &[i8], x: &[i8]) -> i32 {
     w.iter().zip(x).map(|(&a, &b)| a as i32 * b as i32).sum()
 }
 
-/// 8 weight rows (laid out by `packed_index_smmla8`) against 8 packed activation
-/// rows over the `full = k / Q8_BLOCK` full blocks of `k`, using ARMv8.6 `smmla`.
-/// Returns unscaled-weight dot products `out[r][t]`; the caller handles any
-/// partial block (`k % Q8_BLOCK`) and multiplies by each weight row's scale.
+/// Computes an 8-row × up-to-8-token `smmla` tile over the `full_blocks` full
+/// 128-element blocks, adds any partial tail block (`k % Q8_BLOCK`), scales by
+/// `w_scales` and adds optional `bias` in NEON, and writes the `tn` (`<= 8`)
+/// token strips directly to `out_ptr` (stride `out_stride`).
 ///
 /// Uses all 32 NEON registers: `v0..v15` hold 16 int32 2×2 subtiles (64 outputs
 /// with zero horizontal `addp` reductions), while `v16..v23` and `v24..v31`
-/// double-buffer two 8-element steps per loop iteration.
+/// double-buffer two 8-element steps per loop iteration. Skips loading `raw` on
+/// the first block and transposes 2×2 subtiles directly via `vuzp1q`/`vuzp2q`.
 ///
 /// # Safety
-/// The CPU must support ARMv8.6 `i8mm` (check `use_i8mm()`).
+/// - The CPU must support ARMv8.6 `i8mm` (check `use_i8mm()`).
+/// - `out_ptr` must be valid for disjoint writes at `j * out_stride .. j * out_stride + 8`
+///   for all `j in 0..tn`.
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
 #[target_feature(enable = "i8mm")]
-pub unsafe fn tile_q8_smmla8_8x8(
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn tile_q8_smmla8_8x8_store(
     w_blk: &[i8],
     x_blk: &[i8],
     s_blk: &[f32],
     full_blocks: usize,
-) -> [[f32; 8]; 8] {
+    w_scales: &[f32; 8],
+    bias: &[f32; 8],
+    tail: Option<(&[i8], &[f32], usize)>,
+    out_ptr: *mut f32,
+    out_stride: usize,
+    tn: usize,
+) {
+    use std::arch::aarch64::*;
     assert!(full_blocks * 8 * Q8_BLOCK <= w_blk.len());
     assert!(full_blocks * 8 * Q8_BLOCK <= x_blk.len());
     assert!(full_blocks * 16 <= s_blk.len());
+    assert!(tn <= 8);
     let mut raw = [0.0f32; 64];
     let wp = w_blk.as_ptr();
     let xp = x_blk.as_ptr();
@@ -725,6 +850,7 @@ pub unsafe fn tile_q8_smmla8_8x8(
         std::arch::asm!(
             ".arch_extension i8mm",
             "cbz {b}, 3f",
+            "mov {first}, #1",
             "2:",
             "movi v0.16b, #0",  "movi v1.16b, #0",  "movi v2.16b, #0",  "movi v3.16b, #0",
             "movi v4.16b, #0",  "movi v5.16b, #0",  "movi v6.16b, #0",  "movi v7.16b, #0",
@@ -780,25 +906,42 @@ pub unsafe fn tile_q8_smmla8_8x8(
             "ldp q20, q21, [{sp}], #32",
             "ldp q22, q23, [{sp}], #32",
             "scvtf v0.4s, v0.4s",   "scvtf v1.4s, v1.4s",   "scvtf v2.4s, v2.4s",   "scvtf v3.4s, v3.4s",
-            "ldp q24, q25, [{out}, #0]",  "ldp q26, q27, [{out}, #32]",
-            "fmla v24.4s, v0.4s, v20.4s", "fmla v25.4s, v1.4s, v21.4s",
-            "fmla v26.4s, v2.4s, v22.4s", "fmla v27.4s, v3.4s, v23.4s",
-            "stp q24, q25, [{out}, #0]",  "stp q26, q27, [{out}, #32]",
             "scvtf v4.4s, v4.4s",   "scvtf v5.4s, v5.4s",   "scvtf v6.4s, v6.4s",   "scvtf v7.4s, v7.4s",
-            "ldp q24, q25, [{out}, #64]", "ldp q26, q27, [{out}, #96]",
-            "fmla v24.4s, v4.4s, v20.4s", "fmla v25.4s, v5.4s, v21.4s",
-            "fmla v26.4s, v6.4s, v22.4s", "fmla v27.4s, v7.4s, v23.4s",
-            "stp q24, q25, [{out}, #64]", "stp q26, q27, [{out}, #96]",
             "scvtf v8.4s, v8.4s",   "scvtf v9.4s, v9.4s",   "scvtf v10.4s, v10.4s", "scvtf v11.4s, v11.4s",
+            "scvtf v12.4s, v12.4s", "scvtf v13.4s, v13.4s", "scvtf v14.4s, v14.4s", "scvtf v15.4s, v15.4s",
+            "cbz {first}, 5f",
+            "mov {first}, #0",
+            "fmul v0.4s, v0.4s, v20.4s",   "fmul v1.4s, v1.4s, v21.4s",
+            "fmul v2.4s, v2.4s, v22.4s",   "fmul v3.4s, v3.4s, v23.4s",
+            "stp q0, q1, [{out}, #0]",     "stp q2, q3, [{out}, #32]",
+            "fmul v4.4s, v4.4s, v20.4s",   "fmul v5.4s, v5.4s, v21.4s",
+            "fmul v6.4s, v6.4s, v22.4s",   "fmul v7.4s, v7.4s, v23.4s",
+            "stp q4, q5, [{out}, #64]",    "stp q6, q7, [{out}, #96]",
+            "fmul v8.4s, v8.4s, v20.4s",   "fmul v9.4s, v9.4s, v21.4s",
+            "fmul v10.4s, v10.4s, v22.4s", "fmul v11.4s, v11.4s, v23.4s",
+            "stp q8, q9, [{out}, #128]",   "stp q10, q11, [{out}, #160]",
+            "fmul v12.4s, v12.4s, v20.4s", "fmul v13.4s, v13.4s, v21.4s",
+            "fmul v14.4s, v14.4s, v22.4s", "fmul v15.4s, v15.4s, v23.4s",
+            "stp q12, q13, [{out}, #192]", "stp q14, q15, [{out}, #224]",
+            "b 6f",
+            "5:",
+            "ldp q24, q25, [{out}, #0]",   "ldp q26, q27, [{out}, #32]",
+            "fmla v24.4s, v0.4s, v20.4s",  "fmla v25.4s, v1.4s, v21.4s",
+            "fmla v26.4s, v2.4s, v22.4s",  "fmla v27.4s, v3.4s, v23.4s",
+            "stp q24, q25, [{out}, #0]",   "stp q26, q27, [{out}, #32]",
+            "ldp q24, q25, [{out}, #64]",  "ldp q26, q27, [{out}, #96]",
+            "fmla v24.4s, v4.4s, v20.4s",  "fmla v25.4s, v5.4s, v21.4s",
+            "fmla v26.4s, v6.4s, v22.4s",  "fmla v27.4s, v7.4s, v23.4s",
+            "stp q24, q25, [{out}, #64]",  "stp q26, q27, [{out}, #96]",
             "ldp q24, q25, [{out}, #128]", "ldp q26, q27, [{out}, #160]",
             "fmla v24.4s, v8.4s, v20.4s",  "fmla v25.4s, v9.4s, v21.4s",
             "fmla v26.4s, v10.4s, v22.4s", "fmla v27.4s, v11.4s, v23.4s",
             "stp q24, q25, [{out}, #128]", "stp q26, q27, [{out}, #160]",
-            "scvtf v12.4s, v12.4s", "scvtf v13.4s, v13.4s", "scvtf v14.4s, v14.4s", "scvtf v15.4s, v15.4s",
             "ldp q24, q25, [{out}, #192]", "ldp q26, q27, [{out}, #224]",
             "fmla v24.4s, v12.4s, v20.4s", "fmla v25.4s, v13.4s, v21.4s",
             "fmla v26.4s, v14.4s, v22.4s", "fmla v27.4s, v15.4s, v23.4s",
             "stp q24, q25, [{out}, #192]", "stp q26, q27, [{out}, #224]",
+            "6:",
             "subs {b}, {b}, #1",
             "b.ne 2b",
             "3:",
@@ -808,6 +951,7 @@ pub unsafe fn tile_q8_smmla8_8x8(
             sp = inout(reg) sp => _,
             out = in(reg) raw.as_mut_ptr(),
             s = out(reg) _,
+            first = out(reg) _,
             out("v0") _, out("v1") _, out("v2") _, out("v3") _,
             out("v4") _, out("v5") _, out("v6") _, out("v7") _,
             out("v8") _, out("v9") _, out("v10") _, out("v11") _,
@@ -818,18 +962,50 @@ pub unsafe fn tile_q8_smmla8_8x8(
             out("v28") _, out("v29") _, out("v30") _, out("v31") _,
             options(nostack),
         );
-    }
-    let mut out = [[0.0f32; 8]; 8];
-    for p in 0..4 {
-        for q in 0..4 {
-            let base = (p * 4 + q) * 4;
-            out[p * 2][q * 2] = raw[base];
-            out[p * 2][q * 2 + 1] = raw[base + 1];
-            out[p * 2 + 1][q * 2] = raw[base + 2];
-            out[p * 2 + 1][q * 2 + 1] = raw[base + 3];
+
+        // Optional partial tail block (`k % Q8_BLOCK != 0`) folded into `raw`
+        // before scaling and storing.
+        if let Some((x_tail, x_tail_scales, rem)) = tail {
+            let tail_base = full_blocks * 8 * Q8_BLOCK;
+            for p in 0..4usize {
+                for in_p in 0..2usize {
+                    let wt = &w_blk[tail_base + (p * 2 + in_p) * rem..][..rem];
+                    for j in 0..tn {
+                        let sum = dot_i8(wt, &x_tail[j * rem..][..rem]);
+                        let q = j / 2;
+                        let in_q = j % 2;
+                        raw[(p * 4 + q) * 4 + in_p * 2 + in_q] += sum as f32 * x_tail_scales[j];
+                    }
+                }
+            }
+        }
+
+        // Transpose 2×2 subtiles directly in NEON, apply weight scales + bias,
+        // and write 8 contiguous floats per token straight to `out_ptr`.
+        let ws_lo = vld1q_f32(w_scales.as_ptr());
+        let ws_hi = vld1q_f32(w_scales.as_ptr().add(4));
+        let b_lo = vld1q_f32(bias.as_ptr());
+        let b_hi = vld1q_f32(bias.as_ptr().add(4));
+        let rp = raw.as_ptr();
+        for q in 0..4usize {
+            let t_even = q * 2;
+            if t_even >= tn {
+                break;
+            }
+            let p0 = vld1q_f32(rp.add(q * 4));
+            let p1 = vld1q_f32(rp.add((4 + q) * 4));
+            let p2 = vld1q_f32(rp.add((8 + q) * 4));
+            let p3 = vld1q_f32(rp.add((12 + q) * 4));
+            let dst0 = out_ptr.add(t_even * out_stride);
+            vst1q_f32(dst0, vfmaq_f32(b_lo, vuzp1q_f32(p0, p1), ws_lo));
+            vst1q_f32(dst0.add(4), vfmaq_f32(b_hi, vuzp1q_f32(p2, p3), ws_hi));
+            if t_even + 1 < tn {
+                let dst1 = out_ptr.add((t_even + 1) * out_stride);
+                vst1q_f32(dst1, vfmaq_f32(b_lo, vuzp2q_f32(p0, p1), ws_lo));
+                vst1q_f32(dst1.add(4), vfmaq_f32(b_hi, vuzp2q_f32(p2, p3), ws_hi));
+            }
         }
     }
-    out
 }
 
 /// Single-token decode over an 8-row `smmla` weight group (`packed_index_smmla8`),
@@ -947,8 +1123,12 @@ mod tests {
     fn tiles_match_naive_for_every_shape_used() {
         // k covers: shorter than one vector group, a tail after whole groups, exact multiples
         for k in [0, 3, 4, 15, 16, 19, 64, 100, 768] {
+            check::<6, 4, 1>(k);
+            check::<6, 1, 2>(k);
             check::<4, 4, 1>(k);
             check::<4, 1, 4>(k);
+            check::<2, 4, 2>(k);
+            check::<1, 4, 4>(k);
             check::<1, 1, 4>(k);
         }
     }
@@ -1134,11 +1314,27 @@ mod tests {
                     .map(|i| w[r * k + i] as f64 * x[i] as f64 * xs[i / Q8_BLOCK] as f64)
                     .sum::<f64>() as f32
             };
-            let got8 = unsafe { tile_q8_smmla8_8x8(&w_packed, &x_packed, &s_packed, full) };
+            let mut got8 = [0.0f32; 64];
+            let ones = [1.0f32; 8];
+            let zeros = [0.0f32; 8];
+            unsafe {
+                tile_q8_smmla8_8x8_store(
+                    &w_packed,
+                    &x_packed,
+                    &s_packed,
+                    full,
+                    &ones,
+                    &zeros,
+                    None,
+                    got8.as_mut_ptr(),
+                    8,
+                    8,
+                );
+            }
             let got1 = unsafe { tile_q8_smmla8_8x1(&w_packed, &x[..k], &xs[..blocks], k) };
             for r in 0..8 {
-                for (t, &v) in got8[r].iter().enumerate() {
-                    assert_close(&[v], &[naive_full(r, t)], 1e-4, 1e-4);
+                for t in 0..8 {
+                    assert_close(&[got8[t * 8 + r]], &[naive_full(r, t)], 1e-4, 1e-4);
                 }
                 assert_close(&[got1[r]], &[naive_all(r)], 1e-4, 1e-4);
             }

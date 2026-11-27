@@ -1,5 +1,5 @@
 pub fn embed(wte: &[f32], wpe: &[f32], ids: &[u32], w: usize) -> Vec<f32> {
-    let mut final_vec: Vec<f32> = Vec::new();
+    let mut final_vec: Vec<f32> = Vec::with_capacity(ids.len() * w);
     for (pos, &id) in ids.iter().enumerate() {
         let t = id as usize;
         let token_start = t * w;
